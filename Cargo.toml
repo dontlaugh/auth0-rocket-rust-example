@@ -1,0 +1,13 @@
+[package]
+name = "rust-plugin-example"
+version = "0.1.0"
+authors = ["Coleman McFarland <coleman.mcfarland@gmail.com>"]
+
+[dependencies]
+libloading = "0.5"
+maud = { version = "*", features = ["rocket"] }
+rocket = "*"
+rocket_codegen = "*"
+serde = "*"
+serde_derive = "*"
+
