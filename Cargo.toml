@@ -1,11 +1,11 @@
 [package]
-name = "rust-plugin-example"
+name = "changes"
 version = "0.1.0"
 authors = ["Coleman McFarland <coleman.mcfarland@gmail.com>"]
 
 [dependencies]
 libloading = "0.5"
-maud = { version = "*", features = ["rocket"] }
+maud = { git = "https://github.com/lfairy/maud.git", branch = "master", features = ["rocket"] }
 rocket = "*"
 rocket_codegen = "*"
 serde = "*"

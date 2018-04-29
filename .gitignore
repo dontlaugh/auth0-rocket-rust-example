@@ -1,3 +1,6 @@
 
 /target
 **/*.rs.bk
+
+# ignore a live config
+Rocket.toml
