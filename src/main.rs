@@ -8,15 +8,19 @@
 extern crate maud;
 extern crate rocket;
 extern crate rocket_codegen;
+extern crate reqwest;
+extern crate url;
 
 #[macro_use]
 extern crate serde_derive;
+extern crate serde_json;
 extern crate serde;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 use std::path::{Path, PathBuf};
 use serde::Serialize;
+use serde_json::ser::to_vec;
 
 use maud::{html, Markup};
 use rocket::response::status;
@@ -26,6 +30,8 @@ use rocket::http::Status;
 use rocket::response::Redirect;
 use rocket::fairing::AdHoc;
 
+use url::Url;
+use rocket::http::uri::URI;
 
 use std::str::FromStr;
 
@@ -48,14 +54,15 @@ fn main() {
 }
 
 fn get_routes() -> Vec<rocket::Route> {
-    routes![index]
+    routes![index, login, login_code]
 }
 
 // deprecated in favor of full-on proc macro stuff
 // https://github.com/rust-lang/rust/issues/29644#issuecomment-359094330
 #[derive(FromForm)]
-struct Code {
-    code: String
+struct CodeAndState {
+    code: String,
+    state: String,
 }
 
 #[get("/")]
@@ -75,52 +82,93 @@ fn protected_authorized(email: Email) -> Result<String, Status> {
 
 #[get("/protected", rank = 2)]
 fn protected_unauthorized() -> Redirect {
-    Redirect::to("/login")
+    Redirect::to("/")
 }
 
 /// Login page!
 #[get("/login")]
-fn login() -> Markup {
-    html!{
-        body {
-            div class="login-form" {
-            }
-        }
-    }
-}
-
-
-
-/// Login callback.
-#[get("/login?<code>")]
-fn login_code(
-    code: Code,
-    settings: State<AppSettings>,
-) -> Result<String, Status> {
-    // There may be a better way to post this.
+fn login(settings: State<AppSettings>) -> Redirect {
     let data = TokenRequest {
         grant_type: String::from_str("authorization_code").unwrap(),
         client_id: settings.client_id.clone(),
         client_secret: settings.client_secret.clone(),
-        code: code.code,
+        //code: code.code,
         redirect_uri: settings.redirect_uri.clone(),
     };
+    Redirect::to(&data.to_url())
+}
+
+
+
+/// Login callback. Auth0 sends a request to this endpoint. In this function,
+/// we extract the "code" and "state" parameters, ensuring that state matches
+/// exactly the string we passed to Auth0's /authorize endpoint. Then we can
+/// use send code the /oauth/token endpoint in exchange for an access token.
+#[get("/callback?<code>")]
+fn login_code(code: CodeAndState, settings: State<AppSettings>) -> Result<String, Status> {
+    use reqwest::header::ContentType;
+    // There may be a better way to post this.
+    let data = TokenRequestWithCode {
+        grant_type: String::from_str("authorization_code").unwrap(),
+        client_id: settings.client_id.clone(),
+        client_secret: settings.client_secret.clone(),
+        code: code.code.clone(),
+        redirect_uri: settings.redirect_uri.clone(),
+    };
+    // TODO check state
+    //let resp = reqwest::get(&data.to_url()).expect("get failed to token endpoint");
+    
+    //let encoded_url = &URI::percent_encode(&data.redirect_uri).to_string();
+    let mut params = HashMap::new();
+    params.insert("grant_type", "authorization_code");
+    params.insert("code", code.code.as_str());
+    params.insert("redirect_uri", &data.redirect_uri);
+    params.insert("client_id", &data.client_id);
+    params.insert("client_secret", &data.client_secret);
+    println!("params! {:?}", params);
+    let token_url = "https://coleman.auth0.com/oauth/token";
+    let resp = reqwest::Client::new()
+        .post(token_url.clone()).header(ContentType(reqwest::mime::APPLICATION_JSON))
+        .body(to_vec(&params).expect("could not serialize hashmap")).send().expect("POST REQUEST");
+    println!("got response: {:?}", resp);
 
     Ok(String::from("Thanks"))
 }
 
-struct CodeRequest {
-
-
-}
-
+struct CodeRequest {}
 
 struct TokenRequest {
     grant_type: String,
     client_id: String,
     client_secret: String,
+    //code: String,
+    redirect_uri: String,
+}
+
+impl TokenRequest {
+    pub fn to_url(&self) -> String {
+        let s = format!(
+            "https://coleman.auth0.com/authorize?response_type=code&client_id={}&redirect_uri={}&scope=openid%20profile&state=offthedamnchain",
+             self.client_id, URI::percent_encode(&self.redirect_uri));
+        s
+    }
+}
+
+struct TokenRequestWithCode {
+    grant_type: String,
+    client_id: String,
+    client_secret: String,
     code: String,
     redirect_uri: String,
+}
+
+impl TokenRequestWithCode {
+    pub fn to_url(&self) -> String {
+        let s = format!(
+            "https://coleman.auth0.com/oauth/token?client_id={}&redirect_uri={}&client_secret={}&code={}",
+             self.client_id, URI::percent_encode(&self.redirect_uri), self.client_secret, self.code);
+        s
+    }
 }
 
 /// Maps session keys to email addresses.

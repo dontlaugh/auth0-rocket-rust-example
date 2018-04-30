@@ -10,4 +10,9 @@ rocket = "*"
 rocket_codegen = "*"
 serde = "*"
 serde_derive = "*"
-
+serde_json = "*"
+# we cannot link a native library twice
+#rustls = "*"
+# we have to use this
+reqwest = "0.8.5"
+url = "1.2"
