@@ -6,11 +6,11 @@
 #![feature(custom_derive)]
 
 extern crate maud;
+extern crate rand;
 extern crate reqwest;
 extern crate rocket;
 extern crate rocket_codegen;
 extern crate url;
-extern crate rand;
 
 #[macro_use]
 extern crate serde_derive;
@@ -25,12 +25,13 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use maud::{html, Markup};
 use reqwest::header::ContentType;
+use reqwest::mime::APPLICATION_JSON;
 use rocket::fairing::AdHoc;
-use rocket::request::{FromRequest, Outcome, Request};
-use rocket::response::{Redirect, status};
-use rocket::State;
-use rocket::http::{Cookie, Cookies, Status};
 use rocket::http::uri::URI;
+use rocket::http::{Cookie, Cookies, Status};
+use rocket::request::{FromRequest, Outcome, Request};
+use rocket::response::{status, Redirect};
+use rocket::State;
 use url::Url;
 
 use std::str::FromStr;
@@ -50,7 +51,7 @@ fn main() {
 }
 
 fn get_routes() -> Vec<rocket::Route> {
-    routes![index, login, login_code]
+    routes![index, login, auth0_callback]
 }
 
 // deprecated in favor of full-on proc macro stuff
@@ -82,38 +83,44 @@ fn protected_unauthorized() -> Redirect {
 }
 
 /// This route reads settings from our application state and redirects to our
-/// configured Auth0 login page. If our user's login is successful, Auth0 will 
+/// configured Auth0 login page. If our user's login is successful, Auth0 will
 /// redirect them back to /callback with "code" and "state" as query params.
 #[get("/auth0")]
 fn login(mut cookies: Cookies, settings: State<AppSettings>) -> Redirect {
     let state = random_state_string();
     cookies.add(Cookie::new("state", state.clone()));
 
-    let data = TokenRequest {
+    let ar = AuthorizeRequest {
         grant_type: String::from("authorization_code"),
         client_id: settings.client_id.clone(),
         client_secret: settings.client_secret.clone(),
         redirect_uri: settings.redirect_uri.clone(),
-        state: state.clone(),
+        state: state,
         auth0_domain: settings.auth0_domain.clone(),
     };
+    let authorize_endpoint =  format!(
+            "https://{}/authorize?response_type=code&client_id={}&redirect_uri={}&scope=openid%20profile&state={}",
+             ar.auth0_domain,
+             ar.client_id,
+             URI::percent_encode(&ar.redirect_uri),
+             ar.state,
+             );
 
-    Redirect::to(&data.to_url())
+    Redirect::to(&authorize_endpoint)
 }
 
-/// Login callback. Auth0 sends a request to this endpoint. In this function,
-/// we extract the "code" and "state" parameters, ensuring that state matches
-/// exactly the string we passed to Auth0's /authorize endpoint. Then we can
-/// use send code the /oauth/token endpoint in exchange for an access token.
+/// Login callback. Auth0 sends a request to this endpoint. In the query string
+/// we extract the "code" and "state" parameters, ensuring that "state" matches
+/// the string we passed to Auth0's /authorize endpoint. Then we can use "code"
+/// in a TokenRequest to the /oauth/token endpoint.
 #[get("/callback?<code>")]
-fn login_code(
-    code: CodeAndState, 
-    cookies: Cookies,
-    sessions: State<SessionMap>, 
-    settings: State<AppSettings>
-    ) -> Result<String, Status> {
-    // There may be a better way to post this.
-    let data = TokenRequestWithCode {
+fn auth0_callback(
+    code: CodeAndState,
+    mut cookies: Cookies,
+    sessions: State<SessionMap>,
+    settings: State<AppSettings>,
+) -> Result<String, Status> {
+    let tr = TokenRequest {
         grant_type: String::from_str("authorization_code").unwrap(),
         client_id: settings.client_id.clone(),
         client_secret: settings.client_secret.clone(),
@@ -124,29 +131,24 @@ fn login_code(
     let state = code.state.clone();
     if let Some(cookie) = cookies.get("state") {
         if state != String::from_str(cookie.value()).unwrap() {
-            return Err(rocket::http::Status::Forbidden)
+            return Err(rocket::http::Status::Forbidden);
         }
     } else {
-        return Err(rocket::http::Status::BadRequest)
+        return Err(rocket::http::Status::BadRequest);
     }
 
-    let mut params = HashMap::new();
-    {
-        params.insert("grant_type", "authorization_code");
-        params.insert("code", code.code.as_str());
-        params.insert("redirect_uri", &data.redirect_uri);
-        params.insert("client_id", &data.client_id);
-        params.insert("client_secret", &data.client_secret);
-    }
+    // named yields a 'static reference; can we use it like a lookup here?
+    cookies.remove(Cookie::named("state"));
 
-    let token_url = "https://coleman.auth0.com/oauth/token";
+    let token_endpoint = format!("https://{}/oauth/token", settings.auth0_domain);
     let resp = reqwest::Client::new()
-        .post(token_url.clone())
-        .header(ContentType(reqwest::mime::APPLICATION_JSON))
-        .body(to_vec(&params).expect("could not serialize hashmap"))
+        .post(&token_endpoint)
+        .header(ContentType(APPLICATION_JSON))
+        .body(to_vec(&tr).expect("could not serialize TokenRequest"))
         .send()
         .expect("POST REQUEST");
-    println!("got response: {:?}", resp);
+
+    // TODO look at response
 
     Ok(String::from("Thanks"))
 }
@@ -157,8 +159,8 @@ pub fn random_state_string() -> String {
     random
 }
 
-
-struct TokenRequest {
+/// Send a AuthorizeRequest to the Auth0 /authorize endpoint.
+struct AuthorizeRequest {
     grant_type: String,
     client_id: String,
     client_secret: String,
@@ -167,34 +169,14 @@ struct TokenRequest {
     auth0_domain: String,
 }
 
-impl TokenRequest {
-    pub fn to_url(&self) -> String {
-        let s = format!(
-            "https://{}/authorize?response_type=code&client_id={}&redirect_uri={}&scope=openid%20profile&state={}",
-             self.auth0_domain, 
-             self.client_id, 
-             URI::percent_encode(&self.redirect_uri), 
-             self.state,
-             );
-        s
-    }
-}
-
-struct TokenRequestWithCode {
+/// Send TokenRequest to the Auth0 /oauth/token endpoint.
+#[derive(Serialize, Deserialize)]
+struct TokenRequest {
     grant_type: String,
     client_id: String,
     client_secret: String,
     code: String,
     redirect_uri: String,
-}
-
-impl TokenRequestWithCode {
-    pub fn to_url(&self) -> String {
-        let s = format!(
-            "https://coleman.auth0.com/oauth/token?client_id={}&redirect_uri={}&client_secret={}&code={}",
-             self.client_id, URI::percent_encode(&self.redirect_uri), self.client_secret, self.code);
-        s
-    }
 }
 
 /// Maps session keys to email addresses.
@@ -210,14 +192,16 @@ struct AppSettings {
 }
 
 impl AppSettings {
-    pub fn from_rocket_config(conf: &rocket::Config) -> Result<AppSettings, rocket::config::ConfigError> {
-            let app_settings = AppSettings {
-                client_id: String::from(conf.get_str("client_id")?),
-                client_secret: String::from(conf.get_str("client_secret")?),
-                redirect_uri: String::from(conf.get_str("redirect_uri")?),
-                auth0_domain: String::from(conf.get_str("auth0_domain")?),
-            };
-            Ok(app_settings)
+    pub fn from_rocket_config(
+        conf: &rocket::Config,
+    ) -> Result<AppSettings, rocket::config::ConfigError> {
+        let app_settings = AppSettings {
+            client_id: String::from(conf.get_str("client_id")?),
+            client_secret: String::from(conf.get_str("client_secret")?),
+            redirect_uri: String::from(conf.get_str("redirect_uri")?),
+            auth0_domain: String::from(conf.get_str("auth0_domain")?),
+        };
+        Ok(app_settings)
     }
 }
 
