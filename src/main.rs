@@ -5,20 +5,29 @@
 #![feature(proc_macro_non_items)]
 #![feature(custom_derive)]
 
+#[cfg(feature="ring-crypto")]
+extern crate jsonwebtoken as jwt;
+#[cfg(feature="default")]
+extern crate frank_jwt as jwt;
+
 extern crate maud;
 extern crate rand;
 extern crate reqwest;
 extern crate rocket;
 extern crate rocket_codegen;
 extern crate url;
+extern crate base64;
 
 #[macro_use]
 extern crate serde_derive;
 extern crate serde;
 extern crate serde_json;
 
+use jwt::{decode, encode, Algorithm };
+
 use serde::Serialize;
 use serde_json::ser::to_vec;
+use std::io::Read;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
@@ -54,12 +63,17 @@ fn get_routes() -> Vec<rocket::Route> {
     routes![index, login, auth0_callback]
 }
 
-// deprecated in favor of full-on proc macro stuff
+// FromForm deprecated? see:
 // https://github.com/rust-lang/rust/issues/29644#issuecomment-359094330
 #[derive(FromForm)]
 struct CodeAndState {
     code: String,
     state: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct Claims {
+    email: String,
 }
 
 #[get("/login")]
@@ -141,14 +155,32 @@ fn auth0_callback(
     cookies.remove(Cookie::named("state"));
 
     let token_endpoint = format!("https://{}/oauth/token", settings.auth0_domain);
-    let resp = reqwest::Client::new()
+    let client = reqwest::Client::new();
+    let resp: TokenResponse = client
         .post(&token_endpoint)
         .header(ContentType(APPLICATION_JSON))
         .body(to_vec(&tr).expect("could not serialize TokenRequest"))
         .send()
-        .expect("POST REQUEST");
+        .expect("POST REQUEST")
+        .json()
+        .expect("could not deserialize response");
 
-    // TODO look at response
+    // It is time to decode the JWT
+    // https://auth0.com/docs/tokens/id-token#verify-the-signature
+    write_file("fetched_token.txt", &resp.id_token.as_bytes());
+
+    let sec = read_file("coleman_pubkey.pem").expect("file reading failed");
+    //let based = base64::encode(&sec); // DIDNT WORK
+
+    // secret from jwks endpoint:
+//    let jwt_header = decode_header(&resp.id_token).expect("decode jwt header");
+//    println!("header: {:?}", jwt_header);
+    let (foo, baz) = decode(
+        &resp.id_token,
+        //based.as_bytes(),
+        &String::from_utf8(sec).expect("from_utf8 failed"),
+        Algorithm::RS256,
+    ).expect("decoding JWT should work, people");
 
     Ok(String::from("Thanks"))
 }
@@ -157,6 +189,19 @@ pub fn random_state_string() -> String {
     use rand::{thread_rng, Rng};
     let random: String = thread_rng().gen_ascii_chars().take(30).collect();
     random
+}
+
+fn read_file(path: &str) -> Option<Vec<u8>> {
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf).ok()?;
+    Some(buf)
+}
+
+fn write_file(path: &str, bytes: &[u8]) {
+    use std::io::Write;
+    let mut f = std::fs::File::create(path).unwrap();
+    f.write_all(bytes).unwrap()
 }
 
 /// Send a AuthorizeRequest to the Auth0 /authorize endpoint.
@@ -177,6 +222,14 @@ struct TokenRequest {
     client_secret: String,
     code: String,
     redirect_uri: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct TokenResponse {
+    access_token: String,
+    expires_in: u32,
+    id_token: String, // JWT type here?
+    token_type: String,
 }
 
 /// Maps session keys to email addresses.
