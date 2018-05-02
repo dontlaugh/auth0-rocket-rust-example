@@ -5,36 +5,45 @@
 #![feature(proc_macro_non_items)]
 #![feature(custom_derive)]
 
-#[cfg(feature="ring-crypto")]
-extern crate jsonwebtoken as jwt;
-#[cfg(feature="default")]
-extern crate frank_jwt as jwt;
+#[cfg(feature = "default")]
+extern crate frank_jwt;
+#[cfg(feature = "ring-crypto")]
+extern crate jsonwebtoken;
 
+extern crate openssl;
+extern crate base64;
 extern crate maud;
 extern crate rand;
 extern crate reqwest;
 extern crate rocket;
 extern crate rocket_codegen;
 extern crate url;
-extern crate base64;
+extern crate x509_parser;
 
 #[macro_use]
 extern crate serde_derive;
 extern crate serde;
 extern crate serde_json;
 
-use jwt::{decode, encode, Algorithm };
+#[cfg(feature = "default")]
+use frank_jwt::{decode, encode, Algorithm};
+
+#[cfg(feature = "ring-crypto")]
+use jsonwebtoken::{decode, decode_header, Algorithm, TokenData, Validation};
 
 use serde::Serialize;
 use serde_json::ser::to_vec;
-use std::io::Read;
+
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::{Arc, Mutex, RwLock};
 
 use maud::{html, Markup};
 use reqwest::header::ContentType;
 use reqwest::mime::APPLICATION_JSON;
+use rocket::config::ConfigError;
 use rocket::fairing::AdHoc;
 use rocket::http::uri::URI;
 use rocket::http::{Cookie, Cookies, Status};
@@ -42,8 +51,7 @@ use rocket::request::{FromRequest, Outcome, Request};
 use rocket::response::{status, Redirect};
 use rocket::State;
 use url::Url;
-
-use std::str::FromStr;
+use x509_parser::pem;
 
 fn main() {
     let sessions = SessionMap(RwLock::new(HashMap::new()));
@@ -165,22 +173,53 @@ fn auth0_callback(
         .json()
         .expect("could not deserialize response");
 
-    // It is time to decode the JWT
+    let jwks_endpoint = format!("https://{}/.well-known/jwks.json", settings.auth0_domain);
+    let mut jwt: JsonWebKeySet = client
+        .get(Url::from_str(&jwks_endpoint).unwrap())
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+
+    let cert_endpoint = format!("https://{}/pem", settings.auth0_domain);
+    let mut pem_cert: String = client
+        .get(Url::from_str(&cert_endpoint).unwrap())
+        .send()
+        .unwrap()
+        .text()
+        .unwrap();
+    println!("pem cert");
+    println!("{}", pem_cert);
+
+    use openssl::x509::X509Builder;
+    let mut x = X509Builder::new();
+
     // https://auth0.com/docs/tokens/id-token#verify-the-signature
-    write_file("fetched_token.txt", &resp.id_token.as_bytes());
+    // der'd up cert
+    //let (_, derd) = pem::pem_to_der(&pem_cert.as_bytes()).unwrap();
 
-    let sec = read_file("coleman_pubkey.pem").expect("file reading failed");
-    //let based = base64::encode(&sec); // DIDNT WORK
+    #[cfg(feature = "default")]
+    {
+        println!("default config");
+        let (foo, baz) = decode(
+            &resp.id_token,
+            //&String::from_utf8(pem_cert).expect("from_utf8 failed"),
+            &pem_cert,
+            Algorithm::RS256,
+        ).expect("decoding JWT should work, people");
+    }
 
-    // secret from jwks endpoint:
-//    let jwt_header = decode_header(&resp.id_token).expect("decode jwt header");
-//    println!("header: {:?}", jwt_header);
-    let (foo, baz) = decode(
-        &resp.id_token,
-        //based.as_bytes(),
-        &String::from_utf8(sec).expect("from_utf8 failed"),
-        Algorithm::RS256,
-    ).expect("decoding JWT should work, people");
+    #[cfg(feature = "ring-crypto")]
+    {
+        println!("ring-crypto config");
+        let headers = decode_header(&resp.id_token).expect("could not decode headers");
+        let token_data: TokenData<HashMap<String, String>> = decode(
+            &resp.id_token,
+            &jwt.keys[0].x5c[0].as_bytes(),
+            &Validation::new(headers.alg),
+        ).unwrap();
+        let claims = &token_data.claims;
+    }
 
     Ok(String::from("Thanks"))
 }
@@ -228,13 +267,32 @@ struct TokenRequest {
 struct TokenResponse {
     access_token: String,
     expires_in: u32,
-    id_token: String, // JWT type here?
+    id_token: String,
     token_type: String,
 }
 
 /// Maps session keys to email addresses.
 #[derive(Debug)]
 struct SessionMap(RwLock<HashMap<String, String>>);
+
+/// Maps the key set at the .well-known/jwks.json endpoint for your Auth0 domain.
+#[derive(Serialize, Deserialize)]
+struct JsonWebKeySet {
+    keys: Vec<JsonWebKey>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct JsonWebKey {
+    alg: String,
+    kty: String,
+    // use is a Rust keyword, so we give the serializer special instructions.
+    #[serde(rename = "use")]
+    _use: String,
+    x5c: Vec<String>,
+    n: String,
+    e: String,
+    x5t: String,
+}
 
 /// For the state of the application, including the client secrets.
 struct AppSettings {
@@ -245,9 +303,7 @@ struct AppSettings {
 }
 
 impl AppSettings {
-    pub fn from_rocket_config(
-        conf: &rocket::Config,
-    ) -> Result<AppSettings, rocket::config::ConfigError> {
+    pub fn from_rocket_config(conf: &rocket::Config) -> Result<AppSettings, ConfigError> {
         let app_settings = AppSettings {
             client_id: String::from(conf.get_str("client_id")?),
             client_secret: String::from(conf.get_str("client_secret")?),

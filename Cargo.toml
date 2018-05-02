@@ -14,3 +14,16 @@ serde_json = "*"
 reqwest = "0.8.5"
 url = "1.2"
 rand = "0.4"
+base64 = "*"
+jsonwebtoken = { git = "https://github.com/anxiousmodernman/jsonwebtoken", branch = "downgrade_ring", optional = true } 
+frank_jwt = { version = "3", optional = true }
+x509-parser = { git = "https://github.com/rusticata/x509-parser", branch = "master" }
+openssl = "*"
+#jsonwebtoken = { version = "4", optional = true }
+
+[features]
+# we compile with frank_jwt library by default
+# opting out of default means you completely ignore token verification
+default = ["frank_jwt"]
+
+ring-crypto = ["jsonwebtoken"]
