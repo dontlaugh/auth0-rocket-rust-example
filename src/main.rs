@@ -10,13 +10,15 @@ extern crate frank_jwt;
 #[cfg(feature = "ring-crypto")]
 extern crate jsonwebtoken;
 
-extern crate openssl;
 extern crate base64;
+extern crate chrono;
 extern crate maud;
+extern crate openssl;
 extern crate rand;
 extern crate reqwest;
 extern crate rocket;
 extern crate rocket_codegen;
+extern crate sled;
 extern crate url;
 extern crate x509_parser;
 
@@ -32,6 +34,7 @@ use frank_jwt::{decode, encode, Algorithm};
 use jsonwebtoken::{decode, decode_header, Algorithm, TokenData, Validation};
 
 use serde::Serialize;
+use serde_json::from_value;
 use serde_json::ser::to_vec;
 
 use std::collections::HashMap;
@@ -40,6 +43,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, RwLock};
 
+use chrono::Utc;
 use maud::{html, Markup};
 use reqwest::header::ContentType;
 use reqwest::mime::APPLICATION_JSON;
@@ -53,18 +57,55 @@ use rocket::State;
 use url::Url;
 use x509_parser::pem;
 
+type DB = Arc<sled::Tree>;
+
 fn main() {
-    let sessions = SessionMap(RwLock::new(HashMap::new()));
     let routes = get_routes();
+    let db: DB = {
+        let config = sled::ConfigBuilder::new().path(".data").build();
+        Arc::new(sled::Tree::start(config).unwrap())
+    };
     rocket::ignite()
         .mount("/", routes)
-        .manage(sessions)
+        .manage(db)
         .attach(AdHoc::on_attach(|rocket| {
             let conf = rocket.config().clone();
             let app_settings = AppSettings::from_rocket_config(&conf).expect("configuration error");
+            {
+                // a callt to state() borrows the rocket instance, but we can
+                // introduce a lexical scope to limit our temporary borrow.
+                let db = rocket.state::<DB>().unwrap();
+                populate_certs(db, &app_settings.auth0_domain);
+            }
+
             Ok(rocket.manage(app_settings))
         }))
         .launch();
+}
+
+fn populate_certs(db: &DB, auth0_domain: &str) {
+    let client = reqwest::Client::new();
+    let cert_endpoint = format!("https://{}/pem", auth0_domain);
+    let mut pem_cert: String = client
+        .get(Url::from_str(&cert_endpoint).unwrap())
+        .send()
+        .unwrap()
+        .text()
+        .unwrap();
+    // openssl stuff
+    // transform cert into X509 struct
+    use openssl::x509::X509;
+    let cert = X509::from_pem(pem_cert.as_bytes()).expect("x509 parse failed");
+    let pk = cert.public_key().unwrap();
+    let pem_pk = pk.public_key_to_pem().unwrap();
+    let der_pk = pk.public_key_to_der().unwrap();
+    let der_cert = cert.to_der().unwrap();
+    // extract public key
+    // save as bytes to database
+
+    db.set(b"jwt_pub_key_pem".to_vec(), pem_pk);
+    db.set(b"jwt_pub_key_der".to_vec(), der_pk);
+    db.set(b"jwt_cert_der".to_vec(), der_cert);
 }
 
 fn get_routes() -> Vec<rocket::Route> {
@@ -139,7 +180,7 @@ fn login(mut cookies: Cookies, settings: State<AppSettings>) -> Redirect {
 fn auth0_callback(
     code: CodeAndState,
     mut cookies: Cookies,
-    sessions: State<SessionMap>,
+    db: State<DB>,
     settings: State<AppSettings>,
 ) -> Result<String, Status> {
     let tr = TokenRequest {
@@ -159,7 +200,6 @@ fn auth0_callback(
         return Err(rocket::http::Status::BadRequest);
     }
 
-    // named yields a 'static reference; can we use it like a lookup here?
     cookies.remove(Cookie::named("state"));
 
     let token_endpoint = format!("https://{}/oauth/token", settings.auth0_domain);
@@ -181,45 +221,38 @@ fn auth0_callback(
         .json()
         .unwrap();
 
-    let cert_endpoint = format!("https://{}/pem", settings.auth0_domain);
-    let mut pem_cert: String = client
-        .get(Url::from_str(&cert_endpoint).unwrap())
-        .send()
-        .unwrap()
-        .text()
-        .unwrap();
-    println!("pem cert");
-    println!("{}", pem_cert);
-
-    use openssl::x509::X509Builder;
-    let mut x = X509Builder::new();
-
-    // https://auth0.com/docs/tokens/id-token#verify-the-signature
-    // der'd up cert
-    //let (_, derd) = pem::pem_to_der(&pem_cert.as_bytes()).unwrap();
-
     #[cfg(feature = "default")]
     {
-        println!("default config");
-        let (foo, baz) = decode(
+        let pk = db.get(b"jwt_pub_key_pem")
+            .map_err(|_| Status::Unauthorized)?
+            .unwrap();
+        let (_, payload) = decode(
             &resp.id_token,
-            //&String::from_utf8(pem_cert).expect("from_utf8 failed"),
-            &pem_cert,
+            &String::from_utf8(pk).expect("from_utf8 failed"),
             Algorithm::RS256,
-        ).expect("decoding JWT should work, people");
+        ).map_err(|_| Status::Unauthorized)?;
+        let now = Utc::now().timestamp();
+        if let Some(exp) = payload.get("exp") {
+            if from_value::<i64>(exp.clone()).map_err(|_| Status::Unauthorized)? < now {
+                return Err(Status::Unauthorized);
+            }
+        }
     }
 
+    // This feature doesn't work right now, because (I think) we need the
+    // private key.
     #[cfg(feature = "ring-crypto")]
     {
+        let pk = db.get(b"jwt_pub_key_der")
+            .expect("jwt_cert_der missing")
+            .unwrap();
         println!("ring-crypto config");
         let headers = decode_header(&resp.id_token).expect("could not decode headers");
-        let token_data: TokenData<HashMap<String, String>> = decode(
-            &resp.id_token,
-            &jwt.keys[0].x5c[0].as_bytes(),
-            &Validation::new(headers.alg),
-        ).unwrap();
-        let claims = &token_data.claims;
+        let token_data: TokenData<HashMap<String, String>> =
+            decode(&resp.id_token, &pk, &Validation::new(headers.alg)).unwrap();
     }
+
+    // hash the jwt for the db and cookie
 
     Ok(String::from("Thanks"))
 }
@@ -340,3 +373,5 @@ impl<'a, 'r> FromRequest<'a, 'r> for Email {
         }
     }
 }
+    
+
