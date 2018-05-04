@@ -22,6 +22,7 @@ sled = "*"
 chrono = "*"
 crypto-hash = "0.3.1"
 bincode = "*"
+keyz = { git = "https://github.com/anxiousmodernman/keyz", branch = "master" }
 #jsonwebtoken = { version = "4", optional = true }
 
 [features]

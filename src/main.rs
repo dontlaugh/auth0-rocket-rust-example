@@ -25,6 +25,9 @@ extern crate url;
 extern crate x509_parser;
 
 #[macro_use]
+extern crate keyz;
+
+#[macro_use]
 extern crate serde_derive;
 extern crate serde;
 extern crate serde_json;
@@ -48,8 +51,9 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, RwLock};
 
-use bincode::{deserialize, serialize, Infinite};
+use bincode::{deserialize, serialize};
 use chrono::Utc;
+use keyz::Key;
 use maud::{html, Markup};
 use reqwest::header::ContentType;
 use reqwest::mime::APPLICATION_JSON;
@@ -239,8 +243,9 @@ fn auth0_callback(
         }
         let jwt = &resp.id_token.clone();
         let hashed_session = hex_digest(HashAlgorithm::SHA256, jwt.as_bytes());
-        let encoded_exp = serialize(&expiration, Infinite).map_err(|_| Status::Unauthorized)?;
-        db.set(hashed_session.as_bytes().to_vec(), encoded_exp);
+        let encoded_exp = serialize(&expiration).map_err(|_| Status::Unauthorized)?;
+        let session_key = make_key!("sessions", "/", hashed_session.clone());
+        db.set(session_key.0, encoded_exp);
         cookies.add(Cookie::new("session", hashed_session));
     }
 
@@ -256,8 +261,6 @@ fn auth0_callback(
         let token_data: TokenData<HashMap<String, String>> =
             decode(&resp.id_token, &pk, &Validation::new(headers.alg)).unwrap();
     }
-
-    // hash the jwt for the db and cookie
 
     Ok(String::from("Thanks"))
 }
@@ -350,6 +353,18 @@ impl AppSettings {
         };
         Ok(app_settings)
     }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Session {
+    user_id: String,
+    expires: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct User {
+    user_id: String,
+    email: String,
 }
 
 #[derive(Debug)]
