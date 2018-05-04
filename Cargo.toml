@@ -4,7 +4,6 @@ version = "0.1.0"
 authors = ["Coleman McFarland <coleman.mcfarland@gmail.com>"]
 
 [dependencies]
-libloading = "0.5"
 maud = { git = "https://github.com/lfairy/maud.git", branch = "master", features = ["rocket"] }
 rocket = "*"
 rocket_codegen = "*"
@@ -19,6 +18,10 @@ jsonwebtoken = { git = "https://github.com/anxiousmodernman/jsonwebtoken", branc
 frank_jwt = { version = "3", optional = true }
 x509-parser = { git = "https://github.com/rusticata/x509-parser", branch = "master" }
 openssl = "*"
+sled = "*"
+chrono = "*"
+crypto-hash = "0.3.1"
+bincode = "*"
 #jsonwebtoken = { version = "4", optional = true }
 
 [features]

@@ -11,7 +11,9 @@ extern crate frank_jwt;
 extern crate jsonwebtoken;
 
 extern crate base64;
+extern crate bincode;
 extern crate chrono;
+extern crate crypto_hash;
 extern crate maud;
 extern crate openssl;
 extern crate rand;
@@ -27,6 +29,9 @@ extern crate serde_derive;
 extern crate serde;
 extern crate serde_json;
 
+use crypto_hash::hex_digest;
+use crypto_hash::Algorithm as HashAlgorithm;
+
 #[cfg(feature = "default")]
 use frank_jwt::{decode, encode, Algorithm};
 
@@ -34,8 +39,8 @@ use frank_jwt::{decode, encode, Algorithm};
 use jsonwebtoken::{decode, decode_header, Algorithm, TokenData, Validation};
 
 use serde::Serialize;
-use serde_json::from_value;
 use serde_json::ser::to_vec;
+use serde_json::{from_value, Value};
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -43,6 +48,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, RwLock};
 
+use bincode::{deserialize, serialize, Infinite};
 use chrono::Utc;
 use maud::{html, Markup};
 use reqwest::header::ContentType;
@@ -72,7 +78,7 @@ fn main() {
             let conf = rocket.config().clone();
             let app_settings = AppSettings::from_rocket_config(&conf).expect("configuration error");
             {
-                // a callt to state() borrows the rocket instance, but we can
+                // a call to state() borrows the rocket instance, but we can
                 // introduce a lexical scope to limit our temporary borrow.
                 let db = rocket.state::<DB>().unwrap();
                 populate_certs(db, &app_settings.auth0_domain);
@@ -97,12 +103,11 @@ fn populate_certs(db: &DB, auth0_domain: &str) {
     use openssl::x509::X509;
     let cert = X509::from_pem(pem_cert.as_bytes()).expect("x509 parse failed");
     let pk = cert.public_key().unwrap();
+    // extract public keys and cert in pem and der
     let pem_pk = pk.public_key_to_pem().unwrap();
     let der_pk = pk.public_key_to_der().unwrap();
     let der_cert = cert.to_der().unwrap();
-    // extract public key
     // save as bytes to database
-
     db.set(b"jwt_pub_key_pem".to_vec(), pem_pk);
     db.set(b"jwt_pub_key_der".to_vec(), der_pk);
     db.set(b"jwt_cert_der".to_vec(), der_cert);
@@ -213,30 +218,30 @@ fn auth0_callback(
         .json()
         .expect("could not deserialize response");
 
-    let jwks_endpoint = format!("https://{}/.well-known/jwks.json", settings.auth0_domain);
-    let mut jwt: JsonWebKeySet = client
-        .get(Url::from_str(&jwks_endpoint).unwrap())
-        .send()
-        .unwrap()
-        .json()
-        .unwrap();
-
     #[cfg(feature = "default")]
     {
         let pk = db.get(b"jwt_pub_key_pem")
             .map_err(|_| Status::Unauthorized)?
-            .unwrap();
+            .expect("public key not in database");
         let (_, payload) = decode(
             &resp.id_token,
             &String::from_utf8(pk).expect("from_utf8 failed"),
             Algorithm::RS256,
         ).map_err(|_| Status::Unauthorized)?;
         let now = Utc::now().timestamp();
+        let mut expiration = 0;
         if let Some(exp) = payload.get("exp") {
-            if from_value::<i64>(exp.clone()).map_err(|_| Status::Unauthorized)? < now {
+            let val = from_value::<i64>(exp.clone()).map_err(|_| Status::Unauthorized)?;
+            if val < now {
                 return Err(Status::Unauthorized);
             }
+            expiration = val;
         }
+        let jwt = &resp.id_token.clone();
+        let hashed_session = hex_digest(HashAlgorithm::SHA256, jwt.as_bytes());
+        let encoded_exp = serialize(&expiration, Infinite).map_err(|_| Status::Unauthorized)?;
+        db.set(hashed_session.as_bytes().to_vec(), encoded_exp);
+        cookies.add(Cookie::new("session", hashed_session));
     }
 
     // This feature doesn't work right now, because (I think) we need the
@@ -373,5 +378,3 @@ impl<'a, 'r> FromRequest<'a, 'r> for Email {
         }
     }
 }
-    
-

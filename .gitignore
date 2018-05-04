@@ -4,3 +4,7 @@
 
 # ignore a live config
 Rocket.toml
+
+# ignore test database
+.data
+
