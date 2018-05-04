@@ -118,7 +118,7 @@ fn populate_certs(db: &DB, auth0_domain: &str) {
 }
 
 fn get_routes() -> Vec<rocket::Route> {
-    routes![index, login, auth0_callback]
+    routes![login, auth0_redirect, auth0_callback, home, guarded_home]
 }
 
 // FromForm deprecated? see:
@@ -135,7 +135,7 @@ struct Claims {
 }
 
 #[get("/login")]
-fn index() -> Markup {
+fn login() -> Markup {
     html!{
        body {
            h1 "hello world"
@@ -144,13 +144,13 @@ fn index() -> Markup {
     }
 }
 
-#[get("/protected")]
-fn protected_authorized(email: Email) -> Result<String, Status> {
+#[get("/")]
+fn home(user: User) -> Result<String, Status> {
     Ok(String::from_str("great").unwrap())
 }
 
-#[get("/protected", rank = 2)]
-fn protected_unauthorized() -> Redirect {
+#[get("/", rank = 2)]
+fn guarded_home() -> Redirect {
     Redirect::to("/login")
 }
 
@@ -158,7 +158,7 @@ fn protected_unauthorized() -> Redirect {
 /// configured Auth0 login page. If our user's login is successful, Auth0 will
 /// redirect them back to /callback with "code" and "state" as query params.
 #[get("/auth0")]
-fn login(mut cookies: Cookies, settings: State<AppSettings>) -> Redirect {
+fn auth0_redirect(mut cookies: Cookies, settings: State<AppSettings>) -> Redirect {
     let state = random_state_string();
     cookies.add(Cookie::new("state", state.clone()));
 
@@ -241,12 +241,40 @@ fn auth0_callback(
             }
             expiration = val;
         }
+
+        let user_id = (|| {
+            match (payload.get("user_id"), payload.get("email")) {
+                (Some(user_id), Some(email)) =>  {
+                    println!("payload has email:{}, user_id: {}", email, user_id);
+                    let user_key = make_key!("users/", user_id.to_string());
+                    match db.get(&user_key.0) {
+                        Ok(None) => {
+                            // create if does not exist.
+                            println!("create user if does not exist!");
+                            let user = User{email: email.to_string(), user_id: user_id.to_string()};
+                            let encoded_user = serialize(&user).map_err(|_| Status::Unauthorized)?;
+                            db.set(user_key.0, encoded_user);
+                            Ok(user.user_id)
+                        },
+                        Ok(Some(user_bytes)) => {
+                            println!("found user bytes!!!!");
+                            Ok(user_id.to_string())
+                        },
+                        _ => Err(Status::Unauthorized)
+                    }
+                    //Ok((user_id.to_string(), email.to_string()))
+                },
+                _ => Err(Status::Unauthorized)
+            }
+        })()?;
+
         let jwt = &resp.id_token.clone();
-        let hashed_session = hex_digest(HashAlgorithm::SHA256, jwt.as_bytes());
-        let encoded_exp = serialize(&expiration).map_err(|_| Status::Unauthorized)?;
-        let session_key = make_key!("sessions", "/", hashed_session.clone());
-        db.set(session_key.0, encoded_exp);
-        cookies.add(Cookie::new("session", hashed_session));
+        let hashed_jwt = hex_digest(HashAlgorithm::SHA256, jwt.as_bytes());
+        let new_session = Session{user_id: user_id, expires: expiration};
+        let encoded_session = serialize(&new_session).map_err(|_| Status::Unauthorized)?;
+        let session_key = make_key!("sessions", "/", hashed_jwt.clone());
+        db.set(session_key.0, encoded_session);
+        cookies.add(Cookie::new("session", hashed_jwt));
     }
 
     // This feature doesn't work right now, because (I think) we need the
@@ -359,6 +387,59 @@ impl AppSettings {
 struct Session {
     user_id: String,
     expires: i64,
+}
+
+impl Session {
+    pub fn expired(&self) -> bool {
+        let now = Utc::now().timestamp();
+        self.expires <= now 
+    }
+}
+
+impl<'a, 'r> FromRequest<'a, 'r> for User {
+    type Error = ();
+    fn from_request(request: &'a Request<'r>) -> Outcome<User, ()> {
+        let session_id: Option<String> = request
+            .cookies()
+            .get("session")
+            .and_then(|cookie| cookie.value().parse().ok());
+        // get session
+        println!("session ID: {:?}", session_id);
+        match session_id {
+            None => rocket::Outcome::Forward(()),
+            Some(session_id) => {
+                let db = State::<DB>::from_request(request).unwrap();
+                let session_key = make_key!("sessions", "/", session_id);
+                println!("session key! {:?}", session_key);
+                match db.get(&session_key.0) {
+                    Ok(Some(sess)) => {
+                        // deserialize
+                        let sess: Session =
+                            deserialize(&sess).expect("could not deserialize session");
+                        println!("found Session {:?}", sess);
+                        // check expiration
+                        if sess.expired() {
+                            println!("expired?!");
+                            return rocket::Outcome::Forward(());
+                        }
+                        // get the user
+                        let user_key = make_key!("users/", sess.user_id);
+                        println!("user key! {:?}", user_key);
+                        match db.get(&user_key.0) {
+                            Ok(Some(user)) => {
+                                println!("Ok(Some(user)) matched");
+                                let user: User =
+                                    deserialize(&user).expect("could not deserialize user");
+                                rocket::Outcome::Success(user)
+                            }
+                            _ => rocket::Outcome::Forward(()),
+                        }
+                    }
+                    _ => rocket::Outcome::Forward(()),
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
