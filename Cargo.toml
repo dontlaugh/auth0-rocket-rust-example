@@ -1,33 +1,49 @@
 [package]
+authors = ["Coleman McFarland <coleman.mcfarland@gmail.com>"]
 name = "changes"
 version = "0.1.0"
-authors = ["Coleman McFarland <coleman.mcfarland@gmail.com>"]
 
 [dependencies]
-maud = { git = "https://github.com/lfairy/maud.git", branch = "master", features = ["rocket"] }
+base64 = "*"
+bincode = "*"
+chrono = "*"
+crypto-hash = "0.3.1"
+error-chain = "*"
+failure = "*"
+openssl = "*"
+rand = "0.4"
+reqwest = "0.8.5"
 rocket = "*"
 rocket_codegen = "*"
 serde = "*"
 serde_derive = "*"
 serde_json = "*"
-reqwest = "0.8.5"
-url = "1.2"
-rand = "0.4"
-base64 = "*"
-jsonwebtoken = { git = "https://github.com/anxiousmodernman/jsonwebtoken", branch = "downgrade_ring", optional = true } 
-frank_jwt = { version = "3", optional = true }
-x509-parser = { git = "https://github.com/rusticata/x509-parser", branch = "master" }
-openssl = "*"
 sled = "*"
-chrono = "*"
-crypto-hash = "0.3.1"
-bincode = "*"
-keyz = { git = "https://github.com/anxiousmodernman/keyz", branch = "master" }
-#jsonwebtoken = { version = "4", optional = true }
+url = "1.2"
+
+[dependencies.frank_jwt]
+optional = true
+version = "3"
+
+[dependencies.jsonwebtoken]
+branch = "downgrade_ring"
+git = "https://github.com/anxiousmodernman/jsonwebtoken"
+optional = true
+
+[dependencies.keyz]
+branch = "master"
+git = "https://github.com/anxiousmodernman/keyz"
+
+[dependencies.maud]
+branch = "master"
+features = ["rocket"]
+git = "https://github.com/lfairy/maud.git"
+
+[dependencies.x509-parser]
+branch = "master"
+git = "https://github.com/rusticata/x509-parser"
 
 [features]
-# we compile with frank_jwt library by default
-# opting out of default means you completely ignore token verification
+# Only the frank_jwt implementation works right now. 
 default = ["frank_jwt"]
-
 ring-crypto = ["jsonwebtoken"]
