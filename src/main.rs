@@ -130,12 +130,14 @@ fn decode_and_validate_jwt(
     pub_key: Vec<u8>,
     jwt: &str,
     aud: &str,
-) -> Result<serde_json::Value, Error> {
+) -> Result<Auth0JWTPayload, Error> {
     let (_, payload) = decode(
         &jwt.to_string(),
         &String::from_utf8(pub_key).expect("pk is not valid UTF-8"),
         Algorithm::RS256,
-    ).map_err(|_| SerializationError)?;
+    ).map_err(|_| AuthError::MalformedJWT {
+        repr: jwt.to_string(),
+    })?;
     let now = Utc::now().timestamp();
     let mut expiration = 0;
     if let Some(exp) = payload.get("exp") {
@@ -153,7 +155,35 @@ fn decode_and_validate_jwt(
             return Err(AuthError::AudienceMismatch)?;
         }
     }
-    Ok(payload)
+    let payload2: Auth0JWTPayload = deserialize(&to_vec(&payload).unwrap()).expect("bad payload");
+
+    Ok(payload2)
+}
+
+fn get_or_create_user(db: &DB, jwt: &Auth0JWTPayload) -> Result<User, Error> {
+    let user_key = make_key!("users/", jwt.user_id.clone());
+    let user = match db.get(&user_key.0) {
+        Ok(None) => {
+            let user = User {
+                email: jwt.email.clone(),
+                user_id: jwt.user_id.clone(),
+            };
+            let encoded_user = serialize(&user).map_err(|_| SerializationError {
+                name: format!("user"),
+            })?;
+            db.set(user_key.0, encoded_user);
+            Ok(user)
+        }
+        Ok(Some(user_bytes)) => {
+            let user: User =
+                deserialize(user_bytes.as_slice()).map_err(|_| DeserializationError {
+                    name: format!("user_bytes"),
+                })?;
+            Ok(user)
+        }
+        Err(e) => Err(DatabaseError)?,
+    };
+    user
 }
 
 fn get_routes() -> Vec<rocket::Route> {
@@ -242,62 +272,27 @@ fn auth0_callback(
 
     #[cfg(feature = "default")]
     {
-        let pk = db.get(b"jwt_pub_key_pem")
+        let pub_key = db.get(b"jwt_pub_key_pem")
             .map_err(|_| Status::Unauthorized)?
             .expect("public key not in database");
-        let (_, payload) = decode(
-            &resp.id_token,
-            &String::from_utf8(pk).expect("pk is not valid UTF-8"),
-            Algorithm::RS256,
-        ).map_err(|_| Status::Unauthorized)?;
-        let now = Utc::now().timestamp();
-        let mut expiration = 0;
-        if let Some(exp) = payload.get("exp") {
-            let val = from_value::<i64>(exp.clone()).map_err(|_| Status::Unauthorized)?;
-            if val < now {
-                return Err(Status::Unauthorized);
-            }
-            expiration = val;
-        }
-        if let Some(aud) = payload.get("aud") {
-            let val = from_value::<String>(aud.clone()).map_err(|_| Status::Unauthorized)?;
-            // This check is specific to Auth0, since they passes your client_id
-            // as the aud param.
-            if val != settings.client_id {
-                println!("bad aud val: {}", val);
-                return Err(Status::Unauthorized);
-            }
-        }
+        let payload = decode_and_validate_jwt(pub_key, &resp.id_token, &settings.client_id)
+            .map_err(|e| match e {
+                AuthError => Status::Unauthorized,
+                _ => Status::InternalServerError,
+            })?;
 
-        let user_id = (|| match (payload.get("user_id"), payload.get("email")) {
-            (Some(user_id), Some(email)) => {
-                let user_key = make_key!("users/", user_id.to_string());
-                match db.get(&user_key.0) {
-                    Ok(None) => {
-                        let user = User {
-                            email: email.to_string(),
-                            user_id: user_id.to_string(),
-                        };
-                        let encoded_user = serialize(&user).map_err(|_| Status::Unauthorized)?;
-                        db.set(user_key.0, encoded_user);
-                        Ok(user.user_id)
-                    }
-                    Ok(Some(user_bytes)) => {
-                        let user: User = deserialize(user_bytes.as_slice()).unwrap();
-                        Ok(user.user_id)
-                    }
-                    _ => Err(Status::Unauthorized),
-                }
-            }
-            _ => Err(Status::Unauthorized),
-        })()?;
+        let user = get_or_create_user(&db, &payload).map_err(|e| match e.downcast_ref() {
+            Some(AuthError::MalformedJWT { .. }) => Status::BadRequest,
+            _ => Status::InternalServerError,
+        })?;
 
         let jwt = &resp.id_token.clone();
         let hashed_jwt = hex_digest(HashAlgorithm::SHA256, jwt.as_bytes());
         let new_session = Session {
-            user_id: user_id,
-            expires: expiration,
+            user_id: user.user_id,
+            expires: 0,
         };
+        panic!("remove dummy value ^^^^");
         let encoded_session = serialize(&new_session).map_err(|_| Status::Unauthorized)?;
         let session_key = make_key!("sessions/", hashed_jwt.clone());
         db.set(session_key.0, encoded_session);
@@ -360,6 +355,15 @@ struct AuthSettings {
     client_secret: String,
     redirect_uri: String,
     auth0_domain: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Auth0JWTPayload {
+    email: String,
+    exp: f64,
+    iss: String,
+    aud: String,
+    user_id: String,
 }
 
 impl AuthSettings {
