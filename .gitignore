@@ -8,3 +8,6 @@ Rocket.toml
 # ignore test database
 .data
 
+# editor stuff
+.vscode
+
