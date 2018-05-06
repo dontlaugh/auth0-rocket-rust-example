@@ -211,11 +211,11 @@ fn auth0_callback(
     let resp: TokenResponse = client
         .post(&token_endpoint)
         .header(ContentType(APPLICATION_JSON))
-        .body(to_vec(&tr).expect("could not serialize TokenRequest"))
+        .body(to_vec(&tr).unwrap())
         .send()
-        .expect("POST REQUEST")
+        .unwrap()
         .json()
-        .expect("could not deserialize response");
+        .expect("could not deserialize response from /oauth/token");
 
     #[cfg(feature = "default")]
     {
