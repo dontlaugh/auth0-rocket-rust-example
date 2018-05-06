@@ -89,7 +89,7 @@ fn main() {
         .attach(AdHoc::on_attach(|rocket: rocket::Rocket| {
             let conf = rocket.config().clone();
             let settings = AuthSettings::from_env(&conf, "AUTH0_CLIENT_SECRET")
-                .expect("could not find AUTH0_CLIENT_SECRET");
+                .expect("AUTH0_CLIENT_SECRET must be set in your environment");
             {
                 // a call to state() borrows the rocket instance, but we can
                 // introduce a lexical scope to limit our temporary borrow.
@@ -154,7 +154,7 @@ fn login() -> Markup {
 #[get("/")]
 fn home(user: User) -> Markup {
     html!{
-        h1 "Protected Route"
+        h1 "Guarded Route"
         div p {
             "You logged in successfully."
         }
@@ -186,7 +186,7 @@ fn auth0_callback(
     mut cookies: Cookies,
     db: State<DB>,
     settings: State<AuthSettings>,
-) -> Result<String, Status> {
+) -> Result<Redirect, Status> {
     let tr = TokenRequest {
         grant_type: String::from("authorization_code"),
         client_id: settings.client_id.clone(),
@@ -195,9 +195,8 @@ fn auth0_callback(
         redirect_uri: settings.redirect_uri.clone(),
     };
 
-    let state = callback_params.state.clone();
     if let Some(cookie) = cookies.get("state") {
-        if state != String::from_str(cookie.value()).unwrap() {
+        if callback_params.state != cookie.value() {
             return Err(rocket::http::Status::Forbidden);
         }
     } else {
@@ -224,7 +223,7 @@ fn auth0_callback(
             .expect("public key not in database");
         let (_, payload) = decode(
             &resp.id_token,
-            &String::from_utf8(pk).expect("from_utf8 failed"),
+            &String::from_utf8(pk).expect("pk is not valid UTF-8"),
             Algorithm::RS256,
         ).map_err(|_| Status::Unauthorized)?;
         let now = Utc::now().timestamp();
@@ -236,10 +235,17 @@ fn auth0_callback(
             }
             expiration = val;
         }
+        if let Some(aud) = payload.get("aud") {
+            let val = from_value::<String>(aud.clone()).map_err(|_| Status::Unauthorized)?;
+            // This check is specific to Auth0
+            if val != settings.client_id {
+                println!("bad aud val: {}", val);
+                return Err(Status::Unauthorized);
+            }
+        }
 
         let user_id = (|| match (payload.get("user_id"), payload.get("email")) {
             (Some(user_id), Some(email)) => {
-                println!("payload has email:{}, user_id: {}", email, user_id);
                 let user_key = make_key!("users/", user_id.to_string());
                 match db.get(&user_key.0) {
                     Ok(None) => {
@@ -285,7 +291,7 @@ fn auth0_callback(
             decode(&resp.id_token, &pk, &Validation::new(headers.alg)).unwrap();
     }
 
-    Ok(String::from("Thanks"))
+    Ok(Redirect::to("/"))
 }
 
 pub fn random_state_string() -> String {
@@ -449,29 +455,3 @@ struct User {
     email: String,
 }
 
-//#[derive(Debug)]
-//struct Email(String);
-//
-//impl<'a, 'r> FromRequest<'a, 'r> for Email {
-//    type Error = ();
-//
-//    fn from_request(request: &'a Request<'r>) -> Outcome<Email, ()> {
-//        let session_id: Option<String> = request
-//            .cookies()
-//            .get_private("session")
-//            .and_then(|cookie| cookie.value().parse().ok());
-//
-//        match session_id {
-//            None => rocket::Outcome::Forward(()),
-//            Some(session_id) => {
-//                let session_map_state = State::<SessionMap>::from_request(request).unwrap();
-//                let session_map = session_map_state.0.read().unwrap();
-//
-//                match session_map.get(&session_id) {
-//                    Some(email) => rocket::Outcome::Success(Email(email.clone())),
-//                    None => rocket::Outcome::Forward(()),
-//                }
-//            }
-//        }
-//    }
-//}
