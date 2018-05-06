@@ -18,6 +18,8 @@ extern crate crypto_hash;
 
 #[macro_use]
 extern crate failure;
+#[macro_use]
+extern crate failure_derive;
 extern crate maud;
 extern crate openssl;
 extern crate rand;
@@ -109,7 +111,6 @@ fn populate_certs(db: &DB, auth0_domain: &str) -> Result<(), Error> {
         .get(Url::from_str(&cert_endpoint).expect("could not parse auth0_domain"))
         .send()?
         .text()?;
-    // openssl stuff
     // transform cert into X509 struct
     use openssl::x509::X509;
     let cert = X509::from_pem(pem_cert.as_bytes()).expect("x509 parse failed");
@@ -123,6 +124,36 @@ fn populate_certs(db: &DB, auth0_domain: &str) -> Result<(), Error> {
     db.set(b"jwt_pub_key_der".to_vec(), der_pk);
     db.set(b"jwt_cert_der".to_vec(), der_cert);
     Ok(())
+}
+
+fn decode_and_validate_jwt(
+    pub_key: Vec<u8>,
+    jwt: &str,
+    aud: &str,
+) -> Result<serde_json::Value, Error> {
+    let (_, payload) = decode(
+        &jwt.to_string(),
+        &String::from_utf8(pub_key).expect("pk is not valid UTF-8"),
+        Algorithm::RS256,
+    ).map_err(|_| SerializationError)?;
+    let now = Utc::now().timestamp();
+    let mut expiration = 0;
+    if let Some(exp) = payload.get("exp") {
+        let val = from_value::<i64>(exp.clone()).unwrap();
+        if val < now {
+            return Err(AuthError::Expired)?;
+        }
+        expiration = val;
+    }
+    if let Some(aud_from_json) = payload.get("aud") {
+        let val = from_value::<String>(aud_from_json.clone()).unwrap();
+        // This check is specific to Auth0, since they passes your client_id
+        // as the aud param.
+        if val != aud {
+            return Err(AuthError::AudienceMismatch)?;
+        }
+    }
+    Ok(payload)
 }
 
 fn get_routes() -> Vec<rocket::Route> {
@@ -187,14 +218,6 @@ fn auth0_callback(
     db: State<DB>,
     settings: State<AuthSettings>,
 ) -> Result<Redirect, Status> {
-    let tr = TokenRequest {
-        grant_type: String::from("authorization_code"),
-        client_id: settings.client_id.clone(),
-        client_secret: settings.client_secret.clone(),
-        code: callback_params.code.clone(),
-        redirect_uri: settings.redirect_uri.clone(),
-    };
-
     if let Some(cookie) = cookies.get("state") {
         if callback_params.state != cookie.value() {
             return Err(rocket::http::Status::Forbidden);
@@ -202,8 +225,9 @@ fn auth0_callback(
     } else {
         return Err(rocket::http::Status::BadRequest);
     }
-
     cookies.remove(Cookie::named("state"));
+
+    let tr = settings.token_request(&callback_params.code);
 
     let token_endpoint = format!("https://{}/oauth/token", settings.auth0_domain);
     let client = reqwest::Client::new();
@@ -237,7 +261,8 @@ fn auth0_callback(
         }
         if let Some(aud) = payload.get("aud") {
             let val = from_value::<String>(aud.clone()).map_err(|_| Status::Unauthorized)?;
-            // This check is specific to Auth0
+            // This check is specific to Auth0, since they passes your client_id
+            // as the aud param.
             if val != settings.client_id {
                 println!("bad aud val: {}", val);
                 return Err(Status::Unauthorized);
@@ -274,7 +299,7 @@ fn auth0_callback(
             expires: expiration,
         };
         let encoded_session = serialize(&new_session).map_err(|_| Status::Unauthorized)?;
-        let session_key = make_key!("sessions", "/", hashed_jwt.clone());
+        let session_key = make_key!("sessions/", hashed_jwt.clone());
         db.set(session_key.0, encoded_session);
         cookies.add(Cookie::new("session", hashed_jwt));
     }
@@ -298,19 +323,6 @@ pub fn random_state_string() -> String {
     use rand::{thread_rng, Rng};
     let random: String = thread_rng().gen_ascii_chars().take(30).collect();
     random
-}
-
-fn read_file(path: &str) -> Option<Vec<u8>> {
-    let mut f = std::fs::File::open(path).ok()?;
-    let mut buf = Vec::new();
-    f.read_to_end(&mut buf).ok()?;
-    Some(buf)
-}
-
-fn write_file(path: &str, bytes: &[u8]) {
-    use std::io::Write;
-    let mut f = std::fs::File::create(path).unwrap();
-    f.write_all(bytes).unwrap()
 }
 
 /// Send a AuthorizeRequest to the Auth0 /authorize endpoint.
@@ -341,30 +353,8 @@ struct TokenResponse {
     token_type: String,
 }
 
-/// Maps session keys to email addresses.
-#[derive(Debug)]
-struct SessionMap(RwLock<HashMap<String, String>>);
-
-/// Maps the key set at the .well-known/jwks.json endpoint for your Auth0 domain.
-#[derive(Serialize, Deserialize)]
-struct JsonWebKeySet {
-    keys: Vec<JsonWebKey>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct JsonWebKey {
-    alg: String,
-    kty: String,
-    // use is a Rust keyword, so we give the serializer special instructions.
-    #[serde(rename = "use")]
-    _use: String,
-    x5c: Vec<String>,
-    n: String,
-    e: String,
-    x5t: String,
-}
-
-/// For the state of the application, including the client secrets.
+/// Configuration state for Auth0, including the client secret, which
+/// must be kept private.
 struct AuthSettings {
     client_id: String,
     client_secret: String,
@@ -373,14 +363,15 @@ struct AuthSettings {
 }
 
 impl AuthSettings {
+    /// Constructs an AuthSettings from Rocket.toml and an the client secret
+    /// environment variable.
     pub fn from_env(
         conf: &rocket::Config,
-        auth0_client_secret_env_var: &str,
+        client_secret_env_var: &str,
     ) -> Result<AuthSettings, ConfigError> {
         let app_settings = AuthSettings {
             client_id: String::from(conf.get_str("client_id")?),
-            client_secret: std::env::var(auth0_client_secret_env_var)
-                .map_err(|_| ConfigError::NotFound)?,
+            client_secret: std::env::var(client_secret_env_var).map_err(|_| ConfigError::NotFound)?,
             redirect_uri: String::from(conf.get_str("redirect_uri")?),
             auth0_domain: String::from(conf.get_str("auth0_domain")?),
         };
@@ -397,8 +388,22 @@ impl AuthSettings {
              state,
              )
     }
+
+    /// Builds a TokenRequest from an authorization code and
+    /// Auth0 config values.
+    pub fn token_request(&self, code: &str) -> TokenRequest {
+        TokenRequest {
+            grant_type: String::from("authorization_code"),
+            client_id: self.client_id.clone(),
+            client_secret: self.client_secret.clone(),
+            code: code.to_string(),
+            redirect_uri: self.redirect_uri.clone(),
+        }
+    }
 }
 
+/// Session is serialized to the database and retrived to check if
+/// a user is logged in.
 #[derive(Debug, Serialize, Deserialize)]
 struct Session {
     user_id: String,
@@ -406,6 +411,7 @@ struct Session {
 }
 
 impl Session {
+    /// Check if the session is expired.
     pub fn expired(&self) -> bool {
         let now = Utc::now().timestamp();
         self.expires <= now
@@ -423,7 +429,7 @@ impl<'a, 'r> FromRequest<'a, 'r> for User {
             None => rocket::Outcome::Forward(()),
             Some(session_id) => {
                 let db = State::<DB>::from_request(request).unwrap();
-                let session_key = make_key!("sessions", "/", session_id);
+                let session_key = make_key!("sessions/", session_id);
                 match db.get(&session_key.0) {
                     Ok(Some(sess)) => {
                         let sess: Session =
@@ -454,4 +460,3 @@ struct User {
     user_id: String,
     email: String,
 }
-
