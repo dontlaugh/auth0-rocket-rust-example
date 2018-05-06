@@ -130,34 +130,28 @@ fn decode_and_validate_jwt(
     pub_key: Vec<u8>,
     jwt: &str,
     aud: &str,
+    auth0_domain: &str,
 ) -> Result<Auth0JWTPayload, Error> {
-    let (_, payload) = decode(
+    let (_, json) = decode(
         &jwt.to_string(),
         &String::from_utf8(pub_key).expect("pk is not valid UTF-8"),
         Algorithm::RS256,
     ).map_err(|_| AuthError::MalformedJWT {
         repr: jwt.to_string(),
     })?;
+    let payload = Auth0JWTPayload::from_json(&json)?;
+    // We've decoded the jwt payload. Now we validate some fields.
     let now = Utc::now().timestamp();
-    let mut expiration = 0;
-    if let Some(exp) = payload.get("exp") {
-        let val = from_value::<i64>(exp.clone()).unwrap();
-        if val < now {
-            return Err(AuthError::Expired)?;
-        }
-        expiration = val;
-    }
-    if let Some(aud_from_json) = payload.get("aud") {
-        let val = from_value::<String>(aud_from_json.clone()).unwrap();
-        // This check is specific to Auth0, since they passes your client_id
-        // as the aud param.
-        if val != aud {
-            return Err(AuthError::AudienceMismatch)?;
-        }
-    }
-    let payload2: Auth0JWTPayload = deserialize(&to_vec(&payload).unwrap()).expect("bad payload");
-
-    Ok(payload2)
+    if payload.exp < now {
+        return Err(AuthError::Expired)?;
+    };
+    if payload.aud != aud {
+        return Err(AuthError::AudienceMismatch)?;
+    };
+    if payload.iss != format!("https://{}/", auth0_domain) {
+        return Err(AuthError::IssuerMismatch)?;
+    };
+    Ok(payload)
 }
 
 fn get_or_create_user(db: &DB, jwt: &Auth0JWTPayload) -> Result<User, Error> {
@@ -275,11 +269,15 @@ fn auth0_callback(
         let pub_key = db.get(b"jwt_pub_key_pem")
             .map_err(|_| Status::Unauthorized)?
             .expect("public key not in database");
-        let payload = decode_and_validate_jwt(pub_key, &resp.id_token, &settings.client_id)
-            .map_err(|e| match e {
-                AuthError => Status::Unauthorized,
-                _ => Status::InternalServerError,
-            })?;
+        let payload = decode_and_validate_jwt(
+            pub_key,
+            &resp.id_token,
+            &settings.client_id,
+            &settings.auth0_domain,
+        ).map_err(|e| match e {
+            AuthError => Status::Unauthorized,
+            _ => Status::InternalServerError,
+        })?;
 
         let user = get_or_create_user(&db, &payload).map_err(|e| match e.downcast_ref() {
             Some(AuthError::MalformedJWT { .. }) => Status::BadRequest,
@@ -290,9 +288,8 @@ fn auth0_callback(
         let hashed_jwt = hex_digest(HashAlgorithm::SHA256, jwt.as_bytes());
         let new_session = Session {
             user_id: user.user_id,
-            expires: 0,
+            expires: payload.exp,
         };
-        panic!("remove dummy value ^^^^");
         let encoded_session = serialize(&new_session).map_err(|_| Status::Unauthorized)?;
         let session_key = make_key!("sessions/", hashed_jwt.clone());
         db.set(session_key.0, encoded_session);
@@ -360,10 +357,35 @@ struct AuthSettings {
 #[derive(Serialize, Deserialize)]
 struct Auth0JWTPayload {
     email: String,
-    exp: f64,
+    user_id: String,
+    exp: i64,
     iss: String,
     aud: String,
-    user_id: String,
+}
+
+impl Auth0JWTPayload {
+    pub fn from_json(json: &Value) -> Result<Auth0JWTPayload, Error> {
+        match (
+            json.get("email"),
+            json.get("user_id"),
+            json.get("exp"),
+            json.get("iss"),
+            json.get("aud"),
+        ) {
+            (Some(email), Some(user_id), Some(exp_str), Some(iss), Some(aud)) => {
+                Ok(Auth0JWTPayload {
+                    email: email.as_str().unwrap().to_string(),
+                    user_id: user_id.as_str().unwrap().to_string(),
+                    exp: exp_str.as_i64().unwrap(),
+                    iss: iss.as_str().unwrap().to_string(),
+                    aud: aud.as_str().unwrap().to_string(),
+                })
+            }
+            _ => Err(AuthError::MalformedJWT {
+                repr: format!("{:?}", json.clone()),
+            })?,
+        }
+    }
 }
 
 impl AuthSettings {

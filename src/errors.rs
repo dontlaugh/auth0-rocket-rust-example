@@ -13,6 +13,8 @@ pub enum AuthError {
     Expired,
     #[fail(display = "audience field check failed")]
     AudienceMismatch,
+    #[fail(display = "issuer field doesn't match fully-qualified Auth0 domain")]
+    IssuerMismatch,
     #[fail(display = "malformed jwt: {}", repr)]
     MalformedJWT { repr: String },
 }
