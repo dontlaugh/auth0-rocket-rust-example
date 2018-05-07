@@ -1,23 +1,19 @@
 #![feature(plugin)]
 #![plugin(rocket_codegen)]
-#![allow(warnings)] // dev only
 #![feature(proc_macro)]
 #![feature(proc_macro_non_items)]
 #![feature(try_trait)]
 #![feature(custom_derive)]
 
-#[cfg(feature = "default")]
-extern crate frank_jwt;
-#[cfg(feature = "ring-crypto")]
-extern crate jsonwebtoken;
-
 extern crate base64;
 extern crate bincode;
 extern crate chrono;
 extern crate crypto_hash;
-
-#[macro_use]
 extern crate failure;
+#[cfg(feature = "default")]
+extern crate frank_jwt;
+#[cfg(feature = "ring-crypto")]
+extern crate jsonwebtoken;
 #[macro_use]
 extern crate failure_derive;
 extern crate maud;
@@ -25,41 +21,25 @@ extern crate openssl;
 extern crate rand;
 extern crate reqwest;
 extern crate rocket;
-extern crate rocket_codegen;
 extern crate sled;
 extern crate url;
 extern crate x509_parser;
-
 #[macro_use]
 extern crate keyz;
-
 #[macro_use]
 extern crate serde_derive;
 extern crate serde;
 extern crate serde_json;
 
+use bincode::{deserialize, serialize};
+use chrono::Utc;
 use crypto_hash::hex_digest;
 use crypto_hash::Algorithm as HashAlgorithm;
 use failure::Error;
-
 #[cfg(feature = "default")]
-use frank_jwt::{decode, encode, Algorithm};
-
+use frank_jwt::{decode, Algorithm};
 #[cfg(feature = "ring-crypto")]
 use jsonwebtoken::{decode, decode_header, Algorithm, TokenData, Validation};
-
-use serde::Serialize;
-use serde_json::ser::to_vec;
-use serde_json::{from_value, Value};
-
-use std::collections::HashMap;
-use std::io::Read;
-use std::path::{Path, PathBuf};
-use std::str::FromStr;
-use std::sync::{Arc, Mutex, RwLock};
-
-use bincode::{deserialize, serialize};
-use chrono::Utc;
 use keyz::Key;
 use maud::{html, Markup};
 use reqwest::header::ContentType;
@@ -69,14 +49,20 @@ use rocket::fairing::AdHoc;
 use rocket::http::uri::URI;
 use rocket::http::{Cookie, Cookies, Status};
 use rocket::request::{FromRequest, Outcome, Request};
-use rocket::response::{status, Redirect};
+use rocket::response::Redirect;
 use rocket::State;
+use serde_json::ser::to_vec;
+use serde_json::Value;
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
+use std::sync::Arc;
 use url::Url;
-use x509_parser::pem;
 
+// Our own error types.
 mod errors;
 use errors::*;
 
+/// Alias to a sled db wrapped in an Arc smart pointer.
 type DB = Arc<sled::Tree>;
 
 fn main() {
@@ -97,7 +83,8 @@ fn main() {
                 // introduce a lexical scope to limit our temporary borrow.
                 let db = rocket.state::<DB>().expect("could not get db state");
                 populate_certs(db, &settings.auth0_domain)
-                    .map_err(|e| panic!("populate_certs: {:?}", e.backtrace()));
+                    .map_err(|e| panic!("populate_certs: {:?}", e.backtrace()))
+                    .unwrap();
             }
             Ok(rocket.manage(settings))
         }))
@@ -107,7 +94,7 @@ fn main() {
 fn populate_certs(db: &DB, auth0_domain: &str) -> Result<(), Error> {
     let client = reqwest::Client::new();
     let cert_endpoint = format!("https://{}/pem", auth0_domain);
-    let mut pem_cert: String = client
+    let pem_cert: String = client
         .get(Url::from_str(&cert_endpoint).expect("could not parse auth0_domain"))
         .send()?
         .text()?;
@@ -120,9 +107,9 @@ fn populate_certs(db: &DB, auth0_domain: &str) -> Result<(), Error> {
     let der_pk = pk.public_key_to_der()?;
     let der_cert = cert.to_der()?;
     // save as bytes to database
-    db.set(b"jwt_pub_key_pem".to_vec(), pem_pk);
-    db.set(b"jwt_pub_key_der".to_vec(), der_pk);
-    db.set(b"jwt_cert_der".to_vec(), der_cert);
+    db.set(b"jwt_pub_key_pem".to_vec(), pem_pk).unwrap();
+    db.set(b"jwt_pub_key_der".to_vec(), der_pk).unwrap();
+    db.set(b"jwt_cert_der".to_vec(), der_cert).unwrap();
     Ok(())
 }
 
@@ -165,7 +152,7 @@ fn get_or_create_user(db: &DB, jwt: &Auth0JWTPayload) -> Result<User, Error> {
             let encoded_user = serialize(&user).map_err(|_| SerializationError {
                 name: format!("user"),
             })?;
-            db.set(user_key.0, encoded_user);
+            db.set(user_key.0, encoded_user).unwrap();
             Ok(user)
         }
         Ok(Some(user_bytes)) => {
@@ -175,7 +162,7 @@ fn get_or_create_user(db: &DB, jwt: &Auth0JWTPayload) -> Result<User, Error> {
                 })?;
             Ok(user)
         }
-        Err(e) => Err(DatabaseError)?,
+        Err(_) => Err(DatabaseError)?,
     };
     user
 }
@@ -225,6 +212,9 @@ fn home(user: User) -> Markup {
             h1 "Guarded Route"
             div p {
                 "You logged in successfully."
+            }
+            div p {
+                "Email: " (user.email)
             }
         }
     }
@@ -295,10 +285,7 @@ fn auth0_callback(
             &resp.id_token,
             &settings.client_id,
             &settings.auth0_domain,
-        ).map_err(|e| match e {
-            AuthError => Status::Unauthorized,
-            _ => Status::InternalServerError,
-        })?;
+        ).map_err(|_| Status::Unauthorized)?;
 
         let user = get_or_create_user(&db, &payload).map_err(|e| match e.downcast_ref() {
             Some(AuthError::MalformedJWT { .. }) => Status::BadRequest,
@@ -313,7 +300,7 @@ fn auth0_callback(
         };
         let encoded_session = serialize(&new_session).map_err(|_| Status::Unauthorized)?;
         let session_key = make_key!("sessions/", hashed_jwt.clone());
-        db.set(session_key.0, encoded_session);
+        db.set(session_key.0, encoded_session).unwrap();
         cookies.add(Cookie::new("session", hashed_jwt));
     }
 
@@ -337,16 +324,6 @@ pub fn random_state_string() -> String {
     use rand::{thread_rng, Rng};
     let random: String = thread_rng().gen_ascii_chars().take(30).collect();
     random
-}
-
-/// Send a AuthorizeRequest to the Auth0 /authorize endpoint.
-struct AuthorizeRequest {
-    grant_type: String,
-    client_id: String,
-    client_secret: String,
-    state: String,
-    redirect_uri: String,
-    auth0_domain: String,
 }
 
 /// Send TokenRequest to the Auth0 /oauth/token endpoint.
