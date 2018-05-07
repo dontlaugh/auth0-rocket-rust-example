@@ -1,19 +1,10 @@
-# Stolen: https://github.com/hyena/rocket-auth0-example/blob/master/Rocket.toml.sample
 
-# This file should be filled in with your own values and copied over to
-# `Rocket.toml`. `Rocket.toml` is not distributed under version control
-# as a precaution to avoid checking in client secrets, etc.
-
-# All these settings are extra, i.e. not rocket paramters
+# We use Rocket's user-defined extra paramters here for Auth0 config values.
 [global]
 client_id = "YOUR_AUTH0_CLIENT_ID"
 client_secret = "YOUR_AUTH0_CLIENT_SECRET"
 redirect_uri = "http://localhost:8000/login"
 auth0_domain = "YOUR_AUTH0_DOMAIN"
-# Uncomment to set a different base_path for mounting rocket.
-# Useful for running behind a reverse proxy.
-# base_path = "/"
 
-[development]
-# If you want cookies to be valid between server restarts, create a secret key.
-# secret_key = "192-bit base64 string"
+# Rocket.toml documentation:
+# https://rocket.rs/guide/configuration/#rockettoml
