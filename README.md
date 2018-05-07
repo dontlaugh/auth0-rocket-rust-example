@@ -7,7 +7,7 @@
 Copy the example Rocket.toml file
 
 ```
-cp Rocket.toml.exmaple Rocket.toml
+cp Rocket.toml.example Rocket.toml
 ```
 
 Edit the `client_id`, `redirect_uri`, and `auth0_domain` with your own values.
