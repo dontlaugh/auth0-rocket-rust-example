@@ -4,11 +4,9 @@ name = "changes"
 version = "0.1.0"
 
 [dependencies]
-base64 = "*"
 bincode = "*"
 chrono = "*"
 crypto-hash = "0.3.1"
-error-chain = "*"
 failure = "*"
 failure_derive = "*"
 openssl = "*"

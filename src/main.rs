@@ -5,7 +5,6 @@
 #![feature(try_trait)]
 #![feature(custom_derive)]
 
-extern crate base64;
 extern crate bincode;
 extern crate chrono;
 extern crate crypto_hash;
@@ -23,7 +22,6 @@ extern crate reqwest;
 extern crate rocket;
 extern crate sled;
 extern crate url;
-extern crate x509_parser;
 #[macro_use]
 extern crate keyz;
 #[macro_use]
