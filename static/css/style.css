@@ -1,0 +1,14 @@
+
+
+a.login {
+   text-decoration: none;
+   color: black;
+}
+a.login:hover {
+   text-decoration: none;
+   color: red;
+}
+
+body {
+    background-color: #E6E4E4;
+}
