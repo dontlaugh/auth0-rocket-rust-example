@@ -181,7 +181,14 @@ fn get_or_create_user(db: &DB, jwt: &Auth0JWTPayload) -> Result<User, Error> {
 }
 
 fn get_routes() -> Vec<rocket::Route> {
-    routes![login, auth0_redirect, auth0_callback, home, guarded_home]
+    routes![
+        login,
+        auth0_redirect,
+        auth0_callback,
+        home,
+        guarded_home,
+        static_files
+    ]
 }
 
 // FromForm deprecated? see:
@@ -192,33 +199,47 @@ struct CallbackParams {
     state: String,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-struct Claims {
-    email: String,
-}
-
+/// Our login link.
 #[get("/login")]
 fn login() -> Markup {
     html!{
-       body {
-           a href="/auth0" "Login With Auth0!"
-       }
-    }
-}
-
-#[get("/")]
-fn home(user: User) -> Markup {
-    html!{
-        h1 "Guarded Route"
-        div p {
-            "You logged in successfully."
+        head {
+            title "Login | Auth0 Rocket Example"
+            link rel="stylesheet" href="static/css/style.css";
+        }
+        body {
+            a class="login" href="/auth0" "Login With Auth0!"
         }
     }
 }
 
+/// This route is chosen if the request guard for User passes (e.g. logged in).
+#[get("/")]
+fn home(user: User) -> Markup {
+    html!{
+        head {
+            title "Welcome | Auth0 Rocket Example"
+            link rel="stylesheet" href="static/css/style.css";
+        }
+        body{
+            h1 "Guarded Route"
+            div p {
+                "You logged in successfully."
+            }
+        }
+    }
+}
+
+/// This redirect fires if you go to "/" without being logged in.
 #[get("/", rank = 2)]
 fn guarded_home() -> Redirect {
     Redirect::to("/login")
+}
+
+/// Serve static files under /static dir.
+#[get("/static/<path..>")]
+fn static_files(path: PathBuf) -> Option<rocket::response::NamedFile> {
+    rocket::response::NamedFile::open(Path::new("static/").join(path)).ok()
 }
 
 /// This route reads settings from our application state and redirects to our
@@ -311,6 +332,7 @@ fn auth0_callback(
     Ok(Redirect::to("/"))
 }
 
+/// Helper to create a random string 30 chars long.
 pub fn random_state_string() -> String {
     use rand::{thread_rng, Rng};
     let random: String = thread_rng().gen_ascii_chars().take(30).collect();
@@ -354,6 +376,8 @@ struct AuthSettings {
     auth0_domain: String,
 }
 
+/// Holds deserialized data from the /oauth/token endpoint. Use the fields
+/// of this struct for validation.
 #[derive(Serialize, Deserialize)]
 struct Auth0JWTPayload {
     email: String,
@@ -364,6 +388,8 @@ struct Auth0JWTPayload {
 }
 
 impl Auth0JWTPayload {
+    /// Creates a Auth0JWTPayload from a subset of fields returned as json
+    /// from the /oauth/token endpoint.
     pub fn from_json(json: &Value) -> Result<Auth0JWTPayload, Error> {
         match (
             json.get("email"),
@@ -444,6 +470,15 @@ impl Session {
     }
 }
 
+/// User implements a Rocket request guard that uses a session cookie to
+/// look up a Session and User in the database. The guard only passes if
+/// the Session is unexpired and the User exists.
+#[derive(Debug, Serialize, Deserialize)]
+struct User {
+    user_id: String,
+    email: String,
+}
+
 impl<'a, 'r> FromRequest<'a, 'r> for User {
     type Error = ();
     fn from_request(request: &'a Request<'r>) -> Outcome<User, ()> {
@@ -479,10 +514,4 @@ impl<'a, 'r> FromRequest<'a, 'r> for User {
             }
         }
     }
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct User {
-    user_id: String,
-    email: String,
 }
