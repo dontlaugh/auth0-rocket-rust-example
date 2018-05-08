@@ -171,7 +171,7 @@ fn get_routes() -> Vec<rocket::Route> {
         auth0_redirect,
         auth0_callback,
         home,
-        guarded_home,
+        home_redirect,
         static_files
     ]
 }
@@ -220,7 +220,7 @@ fn home(user: User) -> Markup {
 
 /// This redirect fires if you go to "/" without being logged in.
 #[get("/", rank = 2)]
-fn guarded_home() -> Redirect {
+fn home_redirect() -> Redirect {
     Redirect::to("/login")
 }
 
