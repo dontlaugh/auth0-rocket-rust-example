@@ -168,6 +168,7 @@ fn get_or_create_user(db: &DB, jwt: &Auth0JWTPayload) -> Result<User, Error> {
 fn get_routes() -> Vec<rocket::Route> {
     routes![
         login,
+        logged_in,
         auth0_redirect,
         auth0_callback,
         home,
@@ -184,8 +185,9 @@ struct CallbackParams {
     state: String,
 }
 
+
 /// Our login link.
-#[get("/login")]
+#[get("/login", rank = 2)]
 fn login() -> Markup {
     html!{
         head {
@@ -200,7 +202,7 @@ fn login() -> Markup {
 
 /// This route is chosen if the request guard for User passes (e.g. logged in).
 #[get("/")]
-fn home(user: User) -> Markup {
+fn home(user: User, _cookies: Cookies) -> Markup {
     html!{
         head {
             title "Welcome | Auth0 Rocket Example"
@@ -214,6 +216,9 @@ fn home(user: User) -> Markup {
             div p {
                 "Email: " (user.email)
             }
+            div p {
+                a class="login" href="/profile" "Another private route"
+            }
         }
     }
 }
@@ -223,6 +228,12 @@ fn home(user: User) -> Markup {
 fn home_redirect() -> Redirect {
     Redirect::to("/login")
 }
+
+#[get("/loggedin")]
+fn logged_in() -> Redirect {
+    Redirect::to("/")
+}
+
 
 /// Serve static files under /static dir.
 #[get("/static/<path..>")]
@@ -256,6 +267,7 @@ fn auth0_callback(
             return Err(rocket::http::Status::Forbidden);
         }
     } else {
+        println!("cookie state bad");
         return Err(rocket::http::Status::BadRequest);
     }
     cookies.remove(Cookie::named("state"));
@@ -299,7 +311,12 @@ fn auth0_callback(
         let encoded_session = serialize(&new_session).map_err(|_| Status::Unauthorized)?;
         let session_key = make_key!("sessions/", hashed_jwt.clone());
         db.set(session_key.0, encoded_session).unwrap();
-        cookies.add(Cookie::new("session", hashed_jwt));
+        let cookie = Cookie::build("session", hashed_jwt)
+            .path("/")
+            .secure(false)
+            .http_only(true)
+            .finish();
+        cookies.add_private(cookie);
     }
 
     // This feature doesn't work right now, because (I think) we need the
@@ -314,7 +331,7 @@ fn auth0_callback(
             decode(&resp.id_token, &pk, &Validation::new(headers.alg)).unwrap();
     }
 
-    Ok(Redirect::to("/"))
+    Ok(Redirect::to("/loggedin"))
 }
 
 /// Helper to create a random string 30 chars long.
@@ -459,11 +476,15 @@ impl<'a, 'r> FromRequest<'a, 'r> for User {
     fn from_request(request: &'a Request<'r>) -> Outcome<User, ()> {
         let session_id: Option<String> = request
             .cookies()
-            .get("session")
+            .get_private("session")
             .and_then(|cookie| cookie.value().parse().ok());
         match session_id {
-            None => rocket::Outcome::Forward(()),
+            None => {
+                println!("no session id");
+                rocket::Outcome::Forward(())
+            },
             Some(session_id) => {
+                println!("session id: {}", session_id);
                 let db = State::<DB>::from_request(request).unwrap();
                 let session_key = make_key!("sessions/", session_id);
                 match db.get(&session_key.0) {
