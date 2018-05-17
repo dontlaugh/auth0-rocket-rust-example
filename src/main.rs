@@ -307,16 +307,17 @@ fn auth0_callback(
         let new_session = Session {
             user_id: user.user_id,
             expires: payload.exp,
+            raw_jwt: jwt.as_bytes().to_vec(),
         };
         let encoded_session = serialize(&new_session).map_err(|_| Status::Unauthorized)?;
         let session_key = make_key!("sessions/", hashed_jwt.clone());
         db.set(session_key.0, encoded_session).unwrap();
         let cookie = Cookie::build("session", hashed_jwt)
             .path("/")
-            .secure(false)
+            .secure(true)
             .http_only(true)
             .finish();
-        cookies.add_private(cookie);
+        cookies.add(cookie);
     }
 
     // This feature doesn't work right now, because (I think) we need the
@@ -452,6 +453,7 @@ impl AuthSettings {
 struct Session {
     user_id: String,
     expires: i64,
+    raw_jwt: Vec<u8>,
 }
 
 impl Session {
@@ -476,7 +478,7 @@ impl<'a, 'r> FromRequest<'a, 'r> for User {
     fn from_request(request: &'a Request<'r>) -> Outcome<User, ()> {
         let session_id: Option<String> = request
             .cookies()
-            .get_private("session")
+            .get("session")
             .and_then(|cookie| cookie.value().parse().ok());
         match session_id {
             None => {
@@ -492,7 +494,6 @@ impl<'a, 'r> FromRequest<'a, 'r> for User {
                         let sess: Session =
                             deserialize(&sess).expect("could not deserialize session");
                         if sess.expired() {
-                            println!("expired?!");
                             return rocket::Outcome::Forward(());
                         }
                         let user_key = make_key!("users/", sess.user_id);

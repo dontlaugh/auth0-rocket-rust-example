@@ -5,5 +5,11 @@ client_id = "YOUR_AUTH0_CLIENT_ID"
 redirect_uri = "http://localhost:8000/login"
 auth0_domain = "YOUR_AUTH0_DOMAIN"
 
+# You must run generate-cert.sh to create these files, or create them by other
+# means.
+[global.tls]
+certs = "certs.pem"
+key = "key.pem"
+
 # Rocket.toml documentation:
 # https://rocket.rs/guide/configuration/#rockettoml

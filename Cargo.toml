@@ -12,13 +12,16 @@ failure_derive = "*"
 openssl = "*"
 rand = "0.4"
 reqwest = "0.8.5"
-rocket = "*"
 rocket_codegen = "*"
 serde = "*"
 serde_derive = "*"
 serde_json = "*"
 sled = "*"
 url = "1.2"
+
+[dependencies.rocket]
+version = "*"
+features = ["tls"]
 
 [dependencies.frank_jwt]
 optional = true
