@@ -1,9 +1,6 @@
-
 ## OAuth with Rocket + Auth0
 
-TODO:
-* logout functionality
-* store encrypted JWT in the database to _re-validate_ sessions if we want
+A basic app that integrates with Auth0.
 
 ### Configuration
 
@@ -14,6 +11,12 @@ cp Rocket.toml.example Rocket.toml
 ```
 
 Edit the `client_id`, `redirect_uri`, and `auth0_domain` with your own values.
+
+If you want to use tls, run our provided script to create certs (needs Go installed)
+
+```
+./generate-cert.sh
+```
 
 You must **also** set `AUTH0_CLIENT_SECRET` in your environment. We use an env
 var to avoid leaking our secret key to the console during startup.
