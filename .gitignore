@@ -11,3 +11,5 @@ Rocket.toml
 # editor stuff
 .vscode
 
+# development cert.pem and key.pem
+*.pem
