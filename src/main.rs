@@ -1,7 +1,7 @@
 #![feature(plugin)]
 #![plugin(rocket_codegen)]
-#![feature(proc_macro)]
 #![feature(proc_macro_non_items)]
+#![feature(use_extern_macros)]
 #![feature(try_trait)]
 #![feature(custom_derive)]
 
@@ -191,11 +191,11 @@ struct CallbackParams {
 fn login() -> Markup {
     html!{
         head {
-            title "Login | Auth0 Rocket Example"
+            title { "Login | Auth0 Rocket Example" }
             link rel="stylesheet" href="static/css/style.css";
         }
         body {
-            a class="login" href="/auth0" "Login With Auth0!"
+            a class="login" href="/auth0" {"Login With Auth0!"}
         }
     }
 }
@@ -205,20 +205,20 @@ fn login() -> Markup {
 fn home(user: User, _cookies: Cookies) -> Markup {
     html!{
         head {
-            title "Welcome | Auth0 Rocket Example"
+            title {"Welcome | Auth0 Rocket Example"}
             link rel="stylesheet" href="static/css/style.css";
         }
         body{
-            h1 "Guarded Route"
-            div p {
+            h1 {"Guarded Route"}
+            div {p {
                 "You logged in successfully."
-            }
-            div p {
+            }}
+            div {p {
                 "Email: " (user.email)
-            }
-            div p {
-                a class="login" href="/profile" "Another private route"
-            }
+            }}
+            div {p {
+                a class="login" href="/profile" {"Another private route"}
+            }}
         }
     }
 }
