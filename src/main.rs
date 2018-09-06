@@ -1,7 +1,6 @@
 #![feature(plugin)]
 #![plugin(rocket_codegen)]
 #![feature(proc_macro_non_items)]
-#![feature(use_extern_macros)]
 #![feature(try_trait)]
 #![feature(custom_derive)]
 
