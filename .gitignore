@@ -10,6 +10,7 @@ Rocket.toml
 
 # editor stuff
 .vscode
+.idea
 
 # development cert.pem and key.pem
 *.pem

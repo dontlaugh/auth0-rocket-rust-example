@@ -1,63 +1,60 @@
 #![feature(plugin)]
-#![plugin(rocket_codegen)]
-#![feature(proc_macro_non_items)]
 #![feature(try_trait)]
 #![feature(custom_derive)]
+#![feature(proc_macro_hygiene, decl_macro)]
+#![feature(try_from)]
 
 extern crate bincode;
 extern crate chrono;
 extern crate crypto_hash;
 extern crate failure;
-#[cfg(feature = "default")]
-extern crate frank_jwt;
-#[cfg(feature = "ring-crypto")]
-extern crate jsonwebtoken;
 #[macro_use]
 extern crate failure_derive;
+extern crate frank_jwt;
+#[macro_use]
+extern crate keyz;
 extern crate maud;
 extern crate openssl;
 extern crate rand;
 extern crate reqwest;
-extern crate rocket;
-extern crate sled;
-extern crate url;
 #[macro_use]
-extern crate keyz;
+extern crate rocket;
+extern crate serde;
 #[macro_use]
 extern crate serde_derive;
-extern crate serde;
 extern crate serde_json;
+extern crate sled;
+extern crate url;
+
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
+use std::sync::Arc;
 
 use bincode::{deserialize, serialize};
 use chrono::Utc;
-use crypto_hash::hex_digest;
 use crypto_hash::Algorithm as HashAlgorithm;
+use crypto_hash::hex_digest;
 use failure::Error;
-#[cfg(feature = "default")]
-use frank_jwt::{decode, Algorithm};
-#[cfg(feature = "ring-crypto")]
-use jsonwebtoken::{decode, decode_header, Algorithm, TokenData, Validation};
+use frank_jwt::{Algorithm, decode};
 use keyz::Key;
 use maud::{html, Markup};
 use reqwest::header::ContentType;
 use reqwest::mime::APPLICATION_JSON;
 use rocket::config::ConfigError;
 use rocket::fairing::AdHoc;
-use rocket::http::uri::URI;
 use rocket::http::{Cookie, Cookies, Status};
+use rocket::http::uri::Uri;
 use rocket::request::{FromRequest, Outcome, Request};
 use rocket::response::Redirect;
 use rocket::State;
 use serde_json::ser::to_vec;
 use serde_json::Value;
-use std::path::{Path, PathBuf};
-use std::str::FromStr;
-use std::sync::Arc;
 use url::Url;
+
+use errors::*;
 
 // Our own error types.
 mod errors;
-use errors::*;
 
 /// Alias to a sled db wrapped in an Arc smart pointer.
 type DB = Arc<sled::Tree>;
@@ -71,7 +68,7 @@ fn main() {
     rocket::ignite()
         .mount("/", routes)
         .manage(db)
-        .attach(AdHoc::on_attach(|rocket: rocket::Rocket| {
+        .attach(AdHoc::on_attach("secrets", |rocket: rocket::Rocket| {
             let conf = rocket.config().clone();
             let settings = AuthSettings::from_env(&conf, "AUTH0_CLIENT_SECRET")
                 .expect("AUTH0_CLIENT_SECRET must be set in your environment");
@@ -176,19 +173,10 @@ fn get_routes() -> Vec<rocket::Route> {
     ]
 }
 
-// FromForm deprecated? see:
-// https://github.com/rust-lang/rust/issues/29644#issuecomment-359094330
-#[derive(FromForm)]
-struct CallbackParams {
-    code: String,
-    state: String,
-}
-
-
 /// Our login link.
 #[get("/login", rank = 2)]
 fn login() -> Markup {
-    html!{
+    html! {
         head {
             title { "Login | Auth0 Rocket Example" }
             link rel="stylesheet" href="static/css/style.css";
@@ -202,7 +190,7 @@ fn login() -> Markup {
 /// This route is chosen if the request guard for User passes (e.g. logged in).
 #[get("/")]
 fn home(user: User, _cookies: Cookies) -> Markup {
-    html!{
+    html! {
         head {
             title {"Welcome | Auth0 Rocket Example"}
             link rel="stylesheet" href="static/css/style.css";
@@ -244,25 +232,30 @@ fn static_files(path: PathBuf) -> Option<rocket::response::NamedFile> {
 /// configured Auth0 login page. If our user's login is successful, Auth0 will
 /// redirect them back to /callback with "code" and "state" as query params.
 #[get("/auth0")]
-fn auth0_redirect(mut cookies: Cookies, settings: State<AuthSettings>) -> Redirect {
+fn auth0_redirect(mut cookies: Cookies, settings: State<AuthSettings>) -> Result<Redirect, Status> {
     let state = random_state_string();
     cookies.add(Cookie::new("state", state.clone()));
-    Redirect::to(&settings.authorize_endpoint_url(&state))
+    let uri = settings.authorize_endpoint_url(&state);
+    println!("{:?}", uri);
+    use std::convert::TryFrom;
+    let redir = Uri::try_from(uri).expect("invalid uri");
+    Ok(Redirect::to(redir))
 }
 
 /// Login callback. Auth0 sends a request to this endpoint. In the query string
 /// we extract the "code" and "state" parameters, ensuring that "state" matches
 /// the string we passed to Auth0's /authorize endpoint. Then we can use "code"
 /// in a TokenRequest to the /oauth/token endpoint.
-#[get("/callback?<callback_params>")]
+#[get("/callback?<code>&<state>")]
 fn auth0_callback(
-    callback_params: CallbackParams,
+    code: String,
+    state: String,
     mut cookies: Cookies,
     db: State<DB>,
     settings: State<AuthSettings>,
 ) -> Result<Redirect, Status> {
     if let Some(cookie) = cookies.get("state") {
-        if callback_params.state != cookie.value() {
+        if state != cookie.value() {
             return Err(rocket::http::Status::Forbidden);
         }
     } else {
@@ -271,9 +264,15 @@ fn auth0_callback(
     }
     cookies.remove(Cookie::named("state"));
 
-    let tr = settings.token_request(&callback_params.code);
+    let tr = settings.token_request(&code);
 
+    // TODO: The call to /oauth/token can panic if there are any misconfigurations: The wrong
+    // secret, for instance; also, if the user is unauthorized. We need a nicer way to handle
+    // unauthorized here. Also, we need a nicer way to debug the response. We deserialize directly
+    // into a TokenResponse, but the auth0 api will return this in the event of misconfiguration:
+    //   "{\"error\":\"access_denied\",\"error_description\":\"Unauthorized\"}"
     let token_endpoint = format!("https://{}/oauth/token", settings.auth0_domain);
+    println!("token endpoint time: {:?}", token_endpoint);
     let client = reqwest::Client::new();
     let resp: TokenResponse = client
         .post(&token_endpoint)
@@ -284,52 +283,37 @@ fn auth0_callback(
         .json()
         .expect("could not deserialize response from /oauth/token");
 
-    #[cfg(feature = "default")]
-    {
-        let pub_key = db.get(b"jwt_pub_key_pem")
-            .map_err(|_| Status::Unauthorized)?
-            .expect("public key not in database");
-        let payload = decode_and_validate_jwt(
-            pub_key,
-            &resp.id_token,
-            &settings.client_id,
-            &settings.auth0_domain,
-        ).map_err(|_| Status::Unauthorized)?;
+    let pub_key = db.get(b"jwt_pub_key_pem")
+        .map_err(|_| Status::Unauthorized)?
+        .expect("public key not in database");
+    let payload = decode_and_validate_jwt(
+        pub_key,
+        &resp.id_token,
+        &settings.client_id,
+        &settings.auth0_domain,
+    ).map_err(|_| Status::Unauthorized)?;
 
-        let user = get_or_create_user(&db, &payload).map_err(|e| match e.downcast_ref() {
-            Some(AuthError::MalformedJWT { .. }) => Status::BadRequest,
-            _ => Status::InternalServerError,
-        })?;
+    let user = get_or_create_user(&db, &payload).map_err(|e| match e.downcast_ref() {
+        Some(AuthError::MalformedJWT { .. }) => Status::BadRequest,
+        _ => Status::InternalServerError,
+    })?;
 
-        let jwt = &resp.id_token.clone();
-        let hashed_jwt = hex_digest(HashAlgorithm::SHA256, jwt.as_bytes());
-        let new_session = Session {
-            user_id: user.user_id,
-            expires: payload.exp,
-            raw_jwt: jwt.as_bytes().to_vec(),
-        };
-        let encoded_session = serialize(&new_session).map_err(|_| Status::Unauthorized)?;
-        let session_key = make_key!("sessions/", hashed_jwt.clone());
-        db.set(session_key.0, encoded_session).unwrap();
-        let cookie = Cookie::build("session", hashed_jwt)
-            .path("/")
-            .secure(true)
-            .http_only(true)
-            .finish();
-        cookies.add(cookie);
-    }
-
-    // This feature doesn't work right now, because (I think) we need the
-    // private key.
-    #[cfg(feature = "ring-crypto")]
-    {
-        let pk = db.get(b"jwt_pub_key_der")
-            .expect("jwt_cert_der missing")
-            .unwrap();
-        let headers = decode_header(&resp.id_token).expect("could not decode headers");
-        let token_data: TokenData<HashMap<String, String>> =
-            decode(&resp.id_token, &pk, &Validation::new(headers.alg)).unwrap();
-    }
+    let jwt = &resp.id_token.clone();
+    let hashed_jwt = hex_digest(HashAlgorithm::SHA256, jwt.as_bytes());
+    let new_session = Session {
+        user_id: user.user_id,
+        expires: payload.exp,
+        raw_jwt: jwt.as_bytes().to_vec(),
+    };
+    let encoded_session = serialize(&new_session).map_err(|_| Status::Unauthorized)?;
+    let session_key = make_key!("sessions/", hashed_jwt.clone());
+    db.set(session_key.0, encoded_session).unwrap();
+    let cookie = Cookie::build("session", hashed_jwt)
+        .path("/")
+        .secure(true)
+        .http_only(true)
+        .finish();
+    cookies.add(cookie);
 
     Ok(Redirect::to("/loggedin"))
 }
@@ -426,11 +410,11 @@ impl AuthSettings {
     pub fn authorize_endpoint_url(&self, state: &str) -> String {
         format!(
             "https://{}/authorize?response_type=code&client_id={}&redirect_uri={}&scope=openid%20profile&state={}",
-             self.auth0_domain,
-             self.client_id,
-             URI::percent_encode(&self.redirect_uri),
-             state,
-             )
+            self.auth0_domain,
+            self.client_id,
+            Uri::percent_encode(&self.redirect_uri),
+            state,
+        )
     }
 
     /// Builds a TokenRequest from an authorization code and
@@ -483,7 +467,7 @@ impl<'a, 'r> FromRequest<'a, 'r> for User {
             None => {
                 println!("no session id");
                 rocket::Outcome::Forward(())
-            },
+            }
             Some(session_id) => {
                 println!("session id: {}", session_id);
                 let db = State::<DB>::from_request(request).unwrap();

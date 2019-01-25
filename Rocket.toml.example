@@ -2,13 +2,13 @@
 # We use Rocket's user-defined extra paramters here for Auth0 config values.
 [global]
 client_id = "YOUR_AUTH0_CLIENT_ID"
-redirect_uri = "http://localhost:8000/login"
+redirect_uri = "https://localhost:8000/callback"
 auth0_domain = "YOUR_AUTH0_DOMAIN"
 
 # You must run generate-cert.sh to create these files, or create them by other
 # means.
 [global.tls]
-certs = "certs.pem"
+certs = "cert.pem"
 key = "key.pem"
 
 # Rocket.toml documentation:
