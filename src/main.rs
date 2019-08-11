@@ -1,69 +1,48 @@
 #![feature(plugin)]
 #![feature(try_trait)]
-#![feature(custom_derive)]
 #![feature(proc_macro_hygiene, decl_macro)]
-#![feature(try_from)]
 
-extern crate bincode;
-extern crate chrono;
-extern crate crypto_hash;
-extern crate failure;
 #[macro_use]
 extern crate failure_derive;
-extern crate frank_jwt;
-#[macro_use]
-extern crate keyz;
-extern crate maud;
-extern crate openssl;
-extern crate rand;
-extern crate reqwest;
-#[macro_use]
-extern crate rocket;
-extern crate serde;
-#[macro_use]
-extern crate serde_derive;
-extern crate serde_json;
-extern crate sled;
-extern crate url;
 
-use std::path::{Path, PathBuf};
-use std::str::FromStr;
-use std::sync::Arc;
-
+use rocket::{get, routes};
+use serde_derive::{Serialize, Deserialize};
 use bincode::{deserialize, serialize};
 use chrono::Utc;
-use crypto_hash::Algorithm as HashAlgorithm;
 use crypto_hash::hex_digest;
+use crypto_hash::Algorithm as HashAlgorithm;
 use failure::Error;
-use frank_jwt::{Algorithm, decode};
-use keyz::Key;
+use frank_jwt::{decode, Algorithm};
+use keyz::{make_key, Key};
 use maud::{html, Markup};
-use reqwest::header::ContentType;
-use reqwest::mime::APPLICATION_JSON;
 use rocket::config::ConfigError;
 use rocket::fairing::AdHoc;
-use rocket::http::{Cookie, Cookies, Status};
 use rocket::http::uri::Uri;
+use rocket::http::{Cookie, Cookies, Status};
 use rocket::request::{FromRequest, Outcome, Request};
 use rocket::response::Redirect;
 use rocket::State;
 use serde_json::ser::to_vec;
 use serde_json::Value;
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
+use std::sync::Arc;
 use url::Url;
 
 use errors::*;
+use rand::Rng;
 
 // Our own error types.
 mod errors;
 
 /// Alias to a sled db wrapped in an Arc smart pointer.
-type DB = Arc<sled::Tree>;
+type DB = Arc<sled::Db>;
 
 fn main() {
     let routes = get_routes();
     let db: DB = {
-        let config = sled::ConfigBuilder::new().path(".data").build();
-        Arc::new(sled::Tree::start(config).unwrap())
+        let cb = sled::ConfigBuilder::new().path(".data").build();
+        Arc::new(sled::Db::start(cb).expect("could not open sled db"))
     };
     rocket::ignite()
         .mount("/", routes)
@@ -77,7 +56,7 @@ fn main() {
                 // introduce a lexical scope to limit our temporary borrow.
                 let db = rocket.state::<DB>().expect("could not get db state");
                 populate_certs(db, &settings.auth0_domain)
-                    .map_err(|e| panic!("populate_certs: {:?}", e.backtrace()))
+                    .map_err(|e| panic!("populate_certs: {:?}", e))
                     .unwrap();
             }
             Ok(rocket.manage(settings))
@@ -89,7 +68,11 @@ fn populate_certs(db: &DB, auth0_domain: &str) -> Result<(), Error> {
     let client = reqwest::Client::new();
     let cert_endpoint = format!("https://{}/pem", auth0_domain);
     let pem_cert: String = client
-        .get(Url::from_str(&cert_endpoint).expect("could not parse auth0_domain"))
+        .get(
+            Url::from_str(&cert_endpoint)
+                .expect("could not parse auth0_domain")
+                .as_str(),
+        )
         .send()?
         .text()?;
     // transform cert into X509 struct
@@ -117,7 +100,8 @@ fn decode_and_validate_jwt(
         &jwt.to_string(),
         &String::from_utf8(pub_key).expect("pk is not valid UTF-8"),
         Algorithm::RS256,
-    ).map_err(|_| AuthError::MalformedJWT {
+    )
+    .map_err(|_| AuthError::MalformedJWT {
         repr: jwt.to_string(),
     })?;
     let payload = Auth0JWTPayload::from_json(&json)?;
@@ -126,7 +110,7 @@ fn decode_and_validate_jwt(
     if payload.exp < now {
         return Err(AuthError::Expired)?;
     };
-    if payload.aud != aud {
+    if payload.aud != aud.to_string() {
         return Err(AuthError::AudienceMismatch)?;
     };
     if payload.iss != format!("https://{}/", auth0_domain) {
@@ -137,8 +121,10 @@ fn decode_and_validate_jwt(
 
 fn get_or_create_user(db: &DB, jwt: &Auth0JWTPayload) -> Result<User, Error> {
     let user_key = make_key!("users/", jwt.user_id.clone());
-    let user = match db.get(&user_key.0) {
-        Ok(None) => {
+
+    let user = match db.get(&user_key.0)? {
+        None => {
+            // user was not found, make a new one
             let user = User {
                 email: jwt.email.clone(),
                 user_id: jwt.user_id.clone(),
@@ -149,14 +135,16 @@ fn get_or_create_user(db: &DB, jwt: &Auth0JWTPayload) -> Result<User, Error> {
             db.set(user_key.0, encoded_user).unwrap();
             Ok(user)
         }
-        Ok(Some(user_bytes)) => {
+        // Some(sled::IVec)
+        Some(sled_ivec) => {
+            // Turn the db type into a regular vec
+            let user_bytes: Vec<u8> = sled_ivec.to_vec();
             let user: User =
                 deserialize(user_bytes.as_slice()).map_err(|_| DeserializationError {
                     name: format!("user_bytes"),
                 })?;
             Ok(user)
         }
-        Err(_) => Err(DatabaseError)?,
     };
     user
 }
@@ -221,7 +209,6 @@ fn logged_in() -> Redirect {
     Redirect::to("/")
 }
 
-
 /// Serve static files under /static dir.
 #[get("/static/<path..>")]
 fn static_files(path: PathBuf) -> Option<rocket::response::NamedFile> {
@@ -276,23 +263,22 @@ fn auth0_callback(
     let client = reqwest::Client::new();
     let resp: TokenResponse = client
         .post(&token_endpoint)
-        .header(ContentType(APPLICATION_JSON))
+        .header("Content-Type", "application/json")
         .body(to_vec(&tr).unwrap())
         .send()
         .unwrap()
         .json()
         .expect("could not deserialize response from /oauth/token");
 
-    let pub_key = db.get(b"jwt_pub_key_pem")
-        .map_err(|_| Status::Unauthorized)?
-        .expect("public key not in database");
+    // TODO: Can we unwrap here because we know for certain we've populated the cert in the db?
+    let pub_key: Vec<u8> = db.get(b"jwt_pub_key_pem").unwrap().unwrap().to_vec();
     let payload = decode_and_validate_jwt(
         pub_key,
         &resp.id_token,
         &settings.client_id,
         &settings.auth0_domain,
-    ).map_err(|_| Status::Unauthorized)?;
-
+    )
+    .map_err(|_| Status::Unauthorized)?;
     let user = get_or_create_user(&db, &payload).map_err(|e| match e.downcast_ref() {
         Some(AuthError::MalformedJWT { .. }) => Status::BadRequest,
         _ => Status::InternalServerError,
@@ -320,8 +306,14 @@ fn auth0_callback(
 
 /// Helper to create a random string 30 chars long.
 pub fn random_state_string() -> String {
-    use rand::{thread_rng, Rng};
-    let random: String = thread_rng().gen_ascii_chars().take(30).collect();
+    use rand::{distributions::Alphanumeric, thread_rng};
+    use std::iter;
+    let mut rng = thread_rng();
+
+    let random: String = iter::repeat(())
+        .map(|()| rng.sample(Alphanumeric))
+        .take(7)
+        .collect();
     random
 }
 
@@ -399,7 +391,8 @@ impl AuthSettings {
     ) -> Result<AuthSettings, ConfigError> {
         let app_settings = AuthSettings {
             client_id: String::from(conf.get_str("client_id")?),
-            client_secret: std::env::var(client_secret_env_var).map_err(|_| ConfigError::NotFound)?,
+            client_secret: std::env::var(client_secret_env_var)
+                .map_err(|_| ConfigError::NotFound)?,
             redirect_uri: String::from(conf.get_str("redirect_uri")?),
             auth0_domain: String::from(conf.get_str("auth0_domain")?),
         };
