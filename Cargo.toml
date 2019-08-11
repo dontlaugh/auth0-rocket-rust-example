@@ -1,7 +1,8 @@
 [package]
 authors = ["Coleman McFarland <coleman.mcfarland@gmail.com>"]
 name = "auth0-rocket-rust-example"
-version = "0.1.0"
+version = "0.2.0"
+edition = "2018"
 
 [dependencies]
 bincode = "1.1.4"
